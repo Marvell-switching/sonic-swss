@@ -1,5 +1,4 @@
 #include <unistd.h>
-#include <getopt.h>
 #include <vector>
 #include <mutex>
 #include "dbconnector.h"
@@ -9,13 +8,9 @@
 #include "schedulermgr.h"
 #include <fstream>
 #include <iostream>
-#include "json.h"
-#include <nlohmann/json.hpp>
-#include "warm_restart.h"
 
 using namespace std;
 using namespace swss;
-using json = nlohmann::json;
 
 /* SELECT() function timeout retry time, in millisecond */
 #define SELECT_TIMEOUT 1000
@@ -34,37 +29,10 @@ void usage()
 
 int main(int argc, char **argv)
 {
-    int opt;
-
     Logger::linkToDbNative("schedulermgrd");
     SWSS_LOG_ENTER();
 
     SWSS_LOG_NOTICE("--- Starting schedulermgrd ---");
-
-    while ((opt = getopt(argc, argv, "l:a:p:z:h")) != -1 )
-    {
-        switch (opt)
-        {
-        case 'l':
-            pg_lookup_file = optarg;
-            break;
-        case 'h':
-            usage();
-            return 1;
-        case 'a':
-            asic_table_file = optarg;
-            break;
-        case 'p':
-            peripherial_table_file = optarg;
-            break;
-        case 'z':
-            zero_profile_file = optarg;
-            break;
-        default: /* '?' */
-            usage();
-            return EXIT_FAILURE;
-        }
-    }
 
     try
     {
@@ -72,7 +40,6 @@ int main(int argc, char **argv)
 
         DBConnector cfgDb("CONFIG_DB", 0);
         DBConnector stateDb("STATE_DB", 0);
-
 
         vector<string> cfg_buffer_tables = {
             CFG_TIME_RANGE_TABLE_NAME,
