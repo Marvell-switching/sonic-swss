@@ -69,7 +69,7 @@ task_process_status SchedulerMgr::createCronjobs(const string &taskName, const s
         if (runOnce){
             // Delete the time range configuration entry after the task has been disabled
             // writeCrontabFile() will delete the crontab file itself after the task has been executed
-            ss << " && /usr/bin/redis-cli -n " << CONFIG_DB << " del '" << CFG_TIME_RANGE_TABLE_NAME << "|" << taskName;
+            ss << " && /usr/bin/redis-cli -n " << CONFIG_DB << " del '" << CFG_TIME_RANGE_TABLE_NAME << "|" << taskName << "'";
         }
         command_disabled = ss.str();
     }
