@@ -26,11 +26,9 @@ public:
     using Orch::doTask;
 
 private:
-
     Table m_cfgTimeRangeTable;
-    Table m_cfgScheduledConfigurationTable;
 
-    ProducerStateTable m_stateTimeRangeStatusTable;
+    Table m_stateTimeRangeStatusTable;
 
     task_process_status writeCrontabFile(const std::string& fileName, const std::string& schedule, const std::string& command, bool deleteSelfAfterCompletion);
     task_process_status createCronjobs(const std::string& rangeName, const std::string& start, const std::string& end, bool runOnce);
