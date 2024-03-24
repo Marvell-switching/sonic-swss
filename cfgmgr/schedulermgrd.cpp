@@ -15,18 +15,6 @@ using namespace swss;
 /* SELECT() function timeout retry time, in millisecond */
 #define SELECT_TIMEOUT 1000
 
-void usage()
-{
-    cout << "Usage: schedulermgrd <-l pg_lookup.ini|-a asic_table.json [-p peripheral_table.json] [-z zero_profiles.json]>" << endl;
-    cout << "       -l pg_lookup.ini: PG profile look up table file (mandatory for static mode)" << endl;
-    cout << "           format: csv" << endl;
-    cout << "           values: 'speed, cable, size, xon,  xoff, dynamic_threshold, xon_offset'" << endl;
-    cout << "       -a asic_table.json: ASIC-specific parameters definition (mandatory for dynamic mode)" << endl;
-    cout << "       -p peripheral_table.json: Peripheral (eg. gearbox) parameters definition (optional for dynamic mode)" << endl;
-    cout << "       -z zero_profiles.json: Zero profiles definition for reclaiming unused buffers (optional for dynamic mode)" << endl;
-}
-
-
 int main(int argc, char **argv)
 {
     Logger::linkToDbNative("schedulermgrd");
