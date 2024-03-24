@@ -31,7 +31,6 @@ int main(int argc, char **argv)
 
         vector<string> cfg_buffer_tables = {
             CFG_TIME_RANGE_TABLE_NAME,
-            CFG_SCHEDULED_CONFIGURATION_TABLE_NAME
         };
         cfgOrchList.emplace_back(new SchedulerMgr(&cfgDb, &stateDb, cfg_buffer_tables));
 
