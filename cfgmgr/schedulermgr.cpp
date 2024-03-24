@@ -17,27 +17,30 @@
 using namespace std;
 using namespace swss;
 
-SchedulerMgr::SchedulerMgr(DBConnector *cfgDb, DBConnector *stateDb, const vector<string> &tableNames):
-        Orch(cfgDb, tableNames),
-        m_cfgTimeRangeTable(cfgDb, CFG_TIME_RANGE_TABLE_NAME),
-        m_cfgScheduledConfigurationTable(cfgDb, CFG_SCHEDULED_CONFIGURATION_TABLE_NAME),
-        m_stateTimeRangeStatusTable(stateDb, STATE_TIME_RANGE_STATUS_TABLE_NAME)
-{}
+SchedulerMgr::SchedulerMgr(DBConnector *cfgDb, DBConnector *stateDb, const vector<string> &tableNames) : Orch(cfgDb, tableNames),
+                                                                                                         m_cfgTimeRangeTable(cfgDb, CFG_TIME_RANGE_TABLE_NAME),
+                                                                                                         m_stateTimeRangeStatusTable(stateDb, STATE_TIME_RANGE_STATUS_TABLE_NAME)
+{
+}
 
-task_process_status SchedulerMgr::writeCrontabFile(const string& fileName, const string& schedule, const string& command, bool deleteSelfAfterCompletion) {
+task_process_status SchedulerMgr::writeCrontabFile(const string &fileName, const string &schedule, const string &command, bool deleteSelfAfterCompletion)
+{
     string cronFileName = CRON_FILES_PATH_PREFIX_STR + fileName;
     ofstream crontabFile{cronFileName};
-    
-    if (crontabFile.fail()) {
+
+    if (crontabFile.fail())
+    {
         SWSS_LOG_ERROR("Failed to create crontab file for %s", fileName.c_str());
         return task_process_status::task_need_retry;
     }
     crontabFile << schedule << " ";
     crontabFile << CRON_USERNAME_STR << " ";
     crontabFile << command;
-    if (deleteSelfAfterCompletion) {
+    if (deleteSelfAfterCompletion)
+    {
         crontabFile << " && rm " << cronFileName;
     }
+    crontabFile << endl;
     crontabFile.close();
 
     SWSS_LOG_DEBUG("Crontab file for %s has been created", fileName.c_str());
@@ -45,7 +48,8 @@ task_process_status SchedulerMgr::writeCrontabFile(const string& fileName, const
 }
 
 // TODO add rollback mechanism
-task_process_status SchedulerMgr::createCronjobs(const string& taskName, const string& startTime, const string& endTime, bool runOnce) {
+task_process_status SchedulerMgr::createCronjobs(const string &taskName, const string &startTime, const string &endTime, bool runOnce)
+{
     string enableCrontabName = taskName + "-enable";
     string disableCrontabName = taskName + "-disable";
 
@@ -62,28 +66,33 @@ task_process_status SchedulerMgr::createCronjobs(const string& taskName, const s
     {
         stringstream ss;
         ss << "/usr/bin/redis-cli -n " << STATE_DB << " HSET '" << STATE_TIME_RANGE_STATUS_TABLE_NAME << "|" << taskName << "' '" << TIME_RANGE_STATUS_STR << "' '" << TIME_RANGE_DISABLED_STR << "'";
+        if (runOnce){
+            // Delete the time range configuration entry after the task has been disabled
+            // writeCrontabFile() will delete the crontab file itself after the task has been executed
+            ss << " && /usr/bin/redis-cli -n " << CONFIG_DB << " del '" << CFG_TIME_RANGE_TABLE_NAME << "|" << taskName;
+        }
         command_disabled = ss.str();
     }
 
     // Service file for enabling the task
-    // TODO Replace with actual command 
-    if (writecCrontabFile(enableCrontabName, endTime, command_enabled, runOnce) != task_process_status::task_success) {
+    if (writeCrontabFile(enableCrontabName, startTime, command_enabled, runOnce) != task_process_status::task_success)
+    {
         return task_process_status::task_need_retry;
     }
 
     // Service file for disabling the task
-    // TODO Replace with actual command 
-    if (writecCrontabFile(disableCrontabName, endTime, command_disabled, runOnce) != task_process_status::task_success) {
+    if (writeCrontabFile(disableCrontabName, endTime, command_disabled, runOnce) != task_process_status::task_success)
+    {
         return task_process_status::task_need_retry;
     }
-
 
     SWSS_LOG_INFO("Succesfully created crontab files for %s", taskName.c_str());
 
     return task_process_status::task_success;
 }
 
-task_process_status SchedulerMgr::doTimeRangeTask(const string& rangeName, const vector<FieldValueTuple> &fieldValues){
+task_process_status SchedulerMgr::doTimeRangeTask(const string &rangeName, const vector<FieldValueTuple> &fieldValues)
+{
     SWSS_LOG_ENTER();
     string start = "";
     string end = "";
@@ -96,30 +105,39 @@ task_process_status SchedulerMgr::doTimeRangeTask(const string& rangeName, const
 
     for (const auto &i : fieldValues)
     {
-        if (fvField(i) == "start"){
+        if (fvField(i) == "start")
+        {
             start = fvValue(i);
-        } else if (fvField(i) == "end"){
+        }
+        else if (fvField(i) == "end")
+        {
             end = fvValue(i);
-        } else if (fvField(i) == "runOnce"){
+        }
+        else if (fvField(i) == "runOnce")
+        {
             runOnce = fvValue(i);
-        } else {
+        }
+        else
+        {
             SWSS_LOG_ERROR("Time range %s has unknown field %s", rangeName.c_str(), fvField(i).c_str());
             // Can skip instead of returning invalid entry
             return task_process_status::task_invalid_entry;
         }
     }
 
-    if (start == "" || end == ""){
+    if (start == "" || end == "")
+    {
         SWSS_LOG_ERROR("Time range %s is missing start or end time", rangeName.c_str());
         return task_process_status::task_invalid_entry;
     }
 
     // Create systemd files for time range and enable them
     // TODO sanitize inputs
-    if (task_process_status::task_need_retry == createCronjobs(rangeName, start, end, (runOnce == "true"))) {
+    if (task_process_status::task_need_retry == createCronjobs(rangeName, start, end, (runOnce == "true")))
+    {
         return task_process_status::task_need_retry;
     }
-    
+
     // Add time range status to range status table in state db
     m_stateTimeRangeStatusTable.set(key, stateTableFieldValues);
 
@@ -152,20 +170,20 @@ void SchedulerMgr::doTask(Consumer &consumer)
         }
         switch (task_status)
         {
-            case task_process_status::task_failed:
-                SWSS_LOG_ERROR("Failed to process table update");
-                return;
-            case task_process_status::task_need_retry:
-                SWSS_LOG_INFO("Unable to process table update. Will retry...");
-                ++it;
-                break;
-            case task_process_status::task_invalid_entry:
-                SWSS_LOG_ERROR("Failed to process invalid entry, drop it");
-                it = consumer.m_toSync.erase(it);
-                break;
-            default:
-                it = consumer.m_toSync.erase(it);
-                break;
+        case task_process_status::task_failed:
+            SWSS_LOG_ERROR("Failed to process table update");
+            return;
+        case task_process_status::task_need_retry:
+            SWSS_LOG_INFO("Unable to process table update. Will retry...");
+            ++it;
+            break;
+        case task_process_status::task_invalid_entry:
+            SWSS_LOG_ERROR("Failed to process invalid entry, drop it");
+            it = consumer.m_toSync.erase(it);
+            break;
+        default:
+            it = consumer.m_toSync.erase(it);
+            break;
         }
     }
 }
