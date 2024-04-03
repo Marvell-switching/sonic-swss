@@ -1,5 +1,5 @@
-#ifndef __SCHEDULERMGR__
-#define __SCHEDULERMGR__
+#ifndef __TIMERANGEMGR__
+#define __TIMERANGEMGR__
 
 #include "dbconnector.h"
 #include "producerstatetable.h"
@@ -7,6 +7,8 @@
 
 #include <map>
 #include <string>
+#include <table.h>
+#include <vector>
 
 namespace swss {
 
@@ -19,15 +21,13 @@ namespace swss {
 #define CRON_USERNAME_STR "root"
 
 
-class SchedulerMgr : public Orch
+class TimeRangeMgr : public Orch
 {
 public:
-    SchedulerMgr(DBConnector *cfgDb, DBConnector *stateDb, const std::vector<std::string> &tableNames);
+    TimeRangeMgr(DBConnector *cfgDb, DBConnector *stateDb, const std::vector<std::string> &tableNames);
     using Orch::doTask;
 
 private:
-    Table m_cfgTimeRangeTable;
-
     Table m_stateTimeRangeStatusTable;
 
     task_process_status writeCrontabFile(const std::string& fileName, const std::string& schedule, const std::string& command, bool deleteSelfAfterCompletion);
@@ -38,4 +38,4 @@ private:
 
 }
 
-#endif /* __SCHEDULERMGR__ */
+#endif /* __TIMERANGEMGR__ */
