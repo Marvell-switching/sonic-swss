@@ -5,7 +5,7 @@
 #include "select.h"
 #include "exec.h"
 #include "schema.h"
-#include "schedulermgr.h"
+#include "timerangemgr.h"
 #include <fstream>
 #include <iostream>
 
@@ -17,10 +17,10 @@ using namespace swss;
 
 int main(int argc, char **argv)
 {
-    Logger::linkToDbNative("schedulermgrd");
+    Logger::linkToDbNative("timerangemgrd");
     SWSS_LOG_ENTER();
 
-    SWSS_LOG_NOTICE("--- Starting schedulermgrd ---");
+    SWSS_LOG_NOTICE("--- Starting timerangemgrd ---");
 
     try
     {
@@ -32,9 +32,9 @@ int main(int argc, char **argv)
         vector<string> cfg_buffer_tables = {
             CFG_TIME_RANGE_TABLE_NAME,
         };
-        cfgOrchList.emplace_back(new SchedulerMgr(&cfgDb, &stateDb, cfg_buffer_tables));
+        cfgOrchList.emplace_back(new TimeRangeMgr(&cfgDb, &stateDb, cfg_buffer_tables));
 
-        auto schedulermgr = cfgOrchList[0];
+        auto timerangemgr = cfgOrchList[0];
 
         swss::Select s;
         for (Orch *o : cfgOrchList)
@@ -56,7 +56,7 @@ int main(int argc, char **argv)
             }
             if (ret == Select::TIMEOUT)
             {
-                schedulermgr->doTask();
+                timerangemgr->doTask();
                 continue;
             }
 

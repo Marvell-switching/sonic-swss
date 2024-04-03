@@ -5,7 +5,7 @@ LIBNL_LIBS = -lnl-genl-3 -lnl-route-3 -lnl-3
 SAIMETA_LIBS = -lsaimeta -lsaimetadata -lzmq
 COMMON_LIBS = -lswsscommon -lpthread
 
-bin_PROGRAMS = vlanmgrd teammgrd portmgrd intfmgrd buffermgrd vrfmgrd nbrmgrd vxlanmgrd sflowmgrd natmgrd coppmgrd tunnelmgrd macsecmgrd fabricmgrd schedulermgrd
+bin_PROGRAMS = vlanmgrd teammgrd portmgrd intfmgrd buffermgrd vrfmgrd nbrmgrd vxlanmgrd sflowmgrd natmgrd coppmgrd tunnelmgrd macsecmgrd fabricmgrd timerangemgrd timebasedconfigmgrd
 
 cfgmgrdir = $(datadir)/swss
 
@@ -96,10 +96,15 @@ tunnelmgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CF
 tunnelmgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
 tunnelmgrd_LDADD = $(LDFLAGS_ASAN) $(COMMON_LIBS) $(SAIMETA_LIBS)
 
-schedulermgrd_SOURCES = schedulermgrd.cpp schedulermgr.cpp $(COMMON_ORCH_SOURCE) shellcmd.h
-schedulermgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
-schedulermgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
-schedulermgrd_LDADD = $(LDFLAGS_ASAN) $(COMMON_LIBS) $(SAIMETA_LIBS)
+timerangemgrd_SOURCES = timerangemgrd.cpp timerangemgr.cpp $(COMMON_ORCH_SOURCE) shellcmd.h
+timerangemgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
+timerangemgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
+timerangemgrd_LDADD = $(LDFLAGS_ASAN) $(COMMON_LIBS) $(SAIMETA_LIBS)
+
+timebasedconfigmgrd_SOURCES = timebasedconfigmgrd.cpp timebasedconfigmgr.cpp $(COMMON_ORCH_SOURCE) shellcmd.h
+timebasedconfigmgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
+timebasedconfigmgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
+timebasedconfigmgrd_LDADD = $(LDFLAGS_ASAN) $(COMMON_LIBS) $(SAIMETA_LIBS)
 
 macsecmgrd_SOURCES = macsecmgrd.cpp macsecmgr.cpp $(COMMON_ORCH_SOURCE) shellcmd.h
 macsecmgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_SAI) $(CFLAGS_ASAN)
@@ -120,7 +125,8 @@ sflowmgrd_SOURCES +=  ../gcovpreload/gcovpreload.cpp
 natmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
 coppmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
 tunnelmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
-schedulermgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+timerangemgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
+timebasedconfigmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
 macsecmgrd_SOURCES += ../gcovpreload/gcovpreload.cpp
 endif
 
@@ -139,6 +145,7 @@ coppmgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
 tunnelmgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
 macsecmgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
 fabricmgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
-schedulermgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
+timerangemgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
+timebasedconfigmgrd_SOURCES += $(top_srcdir)/lib/asan.cpp
 endif
 
