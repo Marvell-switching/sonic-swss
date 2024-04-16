@@ -1,5 +1,5 @@
-#ifndef __TIMEBASEDCONFIGMGR__
-#define __TIMEBASEDCONFIGMGR__
+#ifndef __SCHEDULEDCONFIGMGR_H__
+#define __SCHEDULEDCONFIGMGR_H__
 
 #include "dbconnector.h"
 #include "producerstatetable.h"
@@ -18,10 +18,10 @@ using TimeRangeConfigMap = std::unordered_map<std::string, ConfigList>; // Maps 
 
 namespace swss {
 
-class TimeBasedConfigMgr : public Orch
+class ScheduledConfigMgr : public Orch
 {
 public:
-    TimeBasedConfigMgr(std::vector<TableConnector>& connectors, DBConnector* appDb);
+    ScheduledConfigMgr(std::vector<TableConnector>& connectors, DBConnector* appDb);
     using Orch::doTask;
 
 private:
@@ -48,4 +48,4 @@ private:
 
 }
 
-#endif /* __TIMEBASEDCONFIGMGR__ */
+#endif /* __SCHEDULEDCONFIGMGR_H__ */

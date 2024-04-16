@@ -5,7 +5,7 @@
 #include <iostream>
 #include <string>
 #include "dbconnector.h"
-#include "timebasedconfigmgr.h"
+#include "scheduledconfigmgr.h"
 #include "json.h"
 #include <nlohmann/json.hpp>
 #include "tokenize.h"
@@ -14,7 +14,7 @@ using namespace std;
 using namespace swss;
 using json = nlohmann::json;
 
-TimeBasedConfigMgr::TimeBasedConfigMgr(vector<TableConnector> &connectors, DBConnector *appDb) : Orch(connectors)
+ScheduledConfigMgr::ScheduledConfigMgr(vector<TableConnector> &connectors, DBConnector *appDb) : Orch(connectors)
 {
     m_appDb = appDb;
 }
@@ -77,12 +77,12 @@ vector<FieldValueTuple> convertJsonToFieldValues(const json &jsonObj)
     return fieldValues;
 }
 
-bool TimeBasedConfigMgr::applyTableConfiguration(const std::string &tableName, const json &tableKeyFields)
+bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, const json &tableKeyFields)
 {
     SWSS_LOG_ENTER();
 
     // Create a Table object for the given tableName
-    Table tableObj(m_appDb, tableName);
+    ProducerStateTable tableObj(m_appDb, tableName);
     // Extract the key and fieldValues from the JSON object
     for (auto it = tableKeyFields.begin(); it != tableKeyFields.end(); ++it) {
         // Extract the key and value from the iterator
@@ -103,7 +103,7 @@ bool TimeBasedConfigMgr::applyTableConfiguration(const std::string &tableName, c
     return true;
 }
 
-task_process_status TimeBasedConfigMgr::applyConfiguration(const std::string &configName, const json &configJson)
+task_process_status ScheduledConfigMgr::applyConfiguration(const std::string &configName, const json &configJson)
 {
     SWSS_LOG_ENTER();
 
@@ -123,13 +123,13 @@ task_process_status TimeBasedConfigMgr::applyConfiguration(const std::string &co
 }
 
 // TODO - Implement this function
-bool TimeBasedConfigMgr::validateConfiguration(const json &configJson)
+bool ScheduledConfigMgr::validateConfiguration(const json &configJson)
 {
     SWSS_LOG_ENTER();
     return true;
 }
 
-task_process_status TimeBasedConfigMgr::doProcessScheduledConfiguration(string timeRangeName, string scheduledConfigName, string configuration)
+task_process_status ScheduledConfigMgr::doProcessScheduledConfiguration(string timeRangeName, string scheduledConfigName, string configuration)
 {
     SWSS_LOG_ENTER();
     SWSS_LOG_INFO("Processing scheduled configuration %s for time range %s", scheduledConfigName.c_str(), timeRangeName.c_str());
@@ -182,7 +182,7 @@ task_process_status TimeBasedConfigMgr::doProcessScheduledConfiguration(string t
     return task_status;
 }
 
-task_process_status TimeBasedConfigMgr::doProcessTimeRangeStatus(string timeRangeName, string status)
+task_process_status ScheduledConfigMgr::doProcessTimeRangeStatus(string timeRangeName, string status)
 {
     SWSS_LOG_ENTER();
     SWSS_LOG_INFO("Processing time range status for time range %s", timeRangeName.c_str());
@@ -213,7 +213,7 @@ task_process_status TimeBasedConfigMgr::doProcessTimeRangeStatus(string timeRang
         else if (status == "disabled")
         {
             // Remove the configuration
-            SWSS_LOG_INFO("Removing configuration for time range %s -- STUB", timeRangeName.c_str());
+            SWSS_LOG_WARN("Removing configuration for time range %s -- STUB", timeRangeName.c_str());
         }
         else
         {
@@ -235,7 +235,7 @@ task_process_status TimeBasedConfigMgr::doProcessTimeRangeStatus(string timeRang
     return task_status;
 }
 
-task_process_status TimeBasedConfigMgr::enableTimeRange(const string &timeRangeName)
+task_process_status ScheduledConfigMgr::enableTimeRange(const string &timeRangeName)
 {
     SWSS_LOG_ENTER();
 
@@ -268,7 +268,7 @@ task_process_status TimeBasedConfigMgr::enableTimeRange(const string &timeRangeN
         return task_process_status::task_success;
 }
 
-void TimeBasedConfigMgr::doTimeRangeTask(Consumer &consumer)
+void ScheduledConfigMgr::doTimeRangeTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
     auto it = consumer.m_toSync.begin();
@@ -323,7 +323,7 @@ void TimeBasedConfigMgr::doTimeRangeTask(Consumer &consumer)
     }
 }
 
-void TimeBasedConfigMgr::doScheduledConfigurationTask(Consumer &consumer)
+void ScheduledConfigMgr::doScheduledConfigurationTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
     auto it = consumer.m_toSync.begin();
@@ -387,7 +387,7 @@ void TimeBasedConfigMgr::doScheduledConfigurationTask(Consumer &consumer)
     }
 }
 
-void TimeBasedConfigMgr::doTask(Consumer &consumer)
+void ScheduledConfigMgr::doTask(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
 
