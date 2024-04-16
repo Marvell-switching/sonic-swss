@@ -5,7 +5,7 @@
 #include "select.h"
 #include "exec.h"
 #include "schema.h"
-#include "timebasedconfigmgr.h"
+#include "scheduledconfigmgr.h"
 #include <fstream>
 #include <iostream>
 
@@ -17,10 +17,10 @@ using namespace swss;
 
 int main(int argc, char **argv)
 {
-    Logger::linkToDbNative("timebasedconfigmgrd");
+    Logger::linkToDbNative("scheduledconfigmgrd");
     SWSS_LOG_ENTER();
 
-    SWSS_LOG_NOTICE("--- Starting timebasedconfigmgrd ---");
+    SWSS_LOG_NOTICE("--- Starting scheduledconfigmgrd ---");
 
     try
     {
@@ -31,14 +31,14 @@ int main(int argc, char **argv)
         DBConnector stateDb("STATE_DB", 0);
         DBConnector appDb("APPL_DB", 0);
         
-        // Create table connectors that TimeBasedConfigMgr will subscribe to
+        // Create table connectors that ScheduledConfigMgr will subscribe to
         TableConnector cfgDbScheduledConfigurations(&cfgDb, CFG_SCHEDULED_CONFIGURATION_TABLE_NAME);
         TableConnector stateDbTimeRangeStatusTable(&stateDb, STATE_TIME_RANGE_STATUS_TABLE_NAME);
         vector<TableConnector> connectors = {cfgDbScheduledConfigurations, stateDbTimeRangeStatusTable};
 
-        cfgOrchList.emplace_back(new TimeBasedConfigMgr(connectors, &appDb));
+        cfgOrchList.emplace_back(new ScheduledConfigMgr(connectors, &appDb));
 
-        auto timebasedconfigmgr = cfgOrchList[0];
+        auto scheduledconfigmgr = cfgOrchList[0];
 
         swss::Select s;
         for (Orch *o : cfgOrchList)
@@ -60,7 +60,7 @@ int main(int argc, char **argv)
             }
             if (ret == Select::TIMEOUT)
             {
-                timebasedconfigmgr->doTask();
+                scheduledconfigmgr->doTask();
                 continue;
             }
 
