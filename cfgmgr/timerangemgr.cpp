@@ -49,11 +49,6 @@ task_process_status TimeRangeMgr::createCronjobs(const string &taskName, const s
 
     // Create command for enabling the task
     string command_enabled = string("/usr/bin/redis-cli -n ") + to_string(STATE_DB) + " HSET '" + STATE_TIME_RANGE_STATUS_TABLE_NAME + "|" + taskName + "' '" + TIME_RANGE_STATUS_STR + "' '" + TIME_RANGE_ENABLED_STR + "'";
-    // {
-    //     stringstream ss;
-    //     ss << "/usr/bin/redis-cli -n " << STATE_DB << " HSET '" << STATE_TIME_RANGE_STATUS_TABLE_NAME << "|" << taskName << "' '" << TIME_RANGE_STATUS_STR << "' '" << TIME_RANGE_ENABLED_STR << "'";
-    //     command_enabled = ss.str();
-    // }
 
     // Create command for disabling the task
     string command_disabled = string("/usr/bin/redis-cli -n ") + to_string(STATE_DB) + " HSET '" + STATE_TIME_RANGE_STATUS_TABLE_NAME + "|" + taskName + "' '" + TIME_RANGE_STATUS_STR + "' '" + TIME_RANGE_DISABLED_STR + "'";
@@ -63,16 +58,6 @@ task_process_status TimeRangeMgr::createCronjobs(const string &taskName, const s
         // writeCrontabFile() will delete the crontab file itself after the task has been executed
         command_disabled += " ; /usr/bin/redis-cli -n " + to_string(CONFIG_DB) + " del '" + CFG_TIME_RANGE_TABLE_NAME + "|" + taskName + "'";
     }
-    // {
-    //     stringstream ss;
-    //     ss << "/usr/bin/redis-cli -n " << STATE_DB << " HSET '" << STATE_TIME_RANGE_STATUS_TABLE_NAME << "|" << taskName << "' '" << TIME_RANGE_STATUS_STR << "' '" << TIME_RANGE_DISABLED_STR << "'";
-    //     if (runOnce){
-    //         // Delete the time range configuration entry after the task has been disabled
-    //         // writeCrontabFile() will delete the crontab file itself after the task has been executed
-    //         ss << " ; /usr/bin/redis-cli -n " << CONFIG_DB << " del '" << CFG_TIME_RANGE_TABLE_NAME << "|" << taskName << "'";
-    //     }
-    //     command_disabled = ss.str();
-    // }
 
     // Service file for enabling the task
     if (writeCrontabFile(enableCrontabName, startTime, command_enabled, runOnce) != task_process_status::task_success)

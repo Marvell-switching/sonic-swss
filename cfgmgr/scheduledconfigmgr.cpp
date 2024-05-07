@@ -83,8 +83,10 @@ bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, c
 
     // Create a Table object for the given tableName
     ProducerStateTable tableObj(m_appDb, tableName);
+    
     // Extract the key and fieldValues from the JSON object
     for (auto it = tableKeyFields.begin(); it != tableKeyFields.end(); ++it) {
+
         // Extract the key and value from the iterator
         const string& key = it.key();
         const json& fieldValuesJson = it.value();
@@ -103,6 +105,18 @@ bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, c
     return true;
 }
 
+bool ScheduledConfigMgr::removeTableConfiguration(const std::string &tableName)
+{
+    SWSS_LOG_ENTER();
+
+    // Create a Table object for the given tableName
+    ProducerStateTable tableObj(m_appDb, tableName);
+
+    // Create a Table object and set the field values
+    tableObj.clear();
+    return true;
+}
+
 task_process_status ScheduledConfigMgr::applyConfiguration(const std::string &configName, const json &configJson)
 {
     SWSS_LOG_ENTER();
@@ -115,6 +129,25 @@ task_process_status ScheduledConfigMgr::applyConfiguration(const std::string &co
         if (!applyTableConfiguration(tableName, tableKeyFields))
         {
             SWSS_LOG_ERROR("Failed to apply configuration %s for table: %s", configName.c_str(), tableName.c_str());
+            return task_process_status::task_failed;
+        }
+    }
+
+    return task_process_status::task_success;
+}
+
+task_process_status ScheduledConfigMgr::removeConfiguration(const std::string &configName, const json &configJson)
+{
+    SWSS_LOG_ENTER();
+    string tableName = "";
+
+    for (const auto &tableEntry : configJson.items())
+    {
+        tableName = tableEntry.key();
+
+        if (!removeTableConfiguration(tableName))
+        {
+            SWSS_LOG_ERROR("Failed to remove configuration %s for table: %s", configName.c_str(), tableName.c_str());
             return task_process_status::task_failed;
         }
     }
@@ -144,19 +177,18 @@ task_process_status ScheduledConfigMgr::doProcessScheduledConfiguration(string t
 
     try
     {
+
         // Parse the configuration string into a JSON object for validation
         // Assuming the configuration is in a JSON string format
-
-        //TODO change to debug
-        SWSS_LOG_INFO("===JSON CONFIGURATION STRING BEFORE PROCESS===");
-        SWSS_LOG_INFO("%s", configuration.c_str());
+        SWSS_LOG_DEBUG("===JSON CONFIGURATION STRING BEFORE PROCESS===");
+        SWSS_LOG_DEBUG("%s", configuration.c_str());
 
         // Simple replacement of single quotes with double quotes
         // Necessary for json to succesfully parse the data
         replace(configuration.begin(), configuration.end(), '\'', '\"');
 
-        SWSS_LOG_INFO("===JSON CONFIGURATION STRING AFTER PROCESS===");
-        SWSS_LOG_INFO("%s", configuration.c_str());
+        SWSS_LOG_DEBUG("===JSON CONFIGURATION STRING AFTER PROCESS===");
+        SWSS_LOG_DEBUG("%s", configuration.c_str());
         
         json configJson = json::parse(configuration);
 
@@ -212,8 +244,7 @@ task_process_status ScheduledConfigMgr::doProcessTimeRangeStatus(string timeRang
             task_status = enableTimeRange(timeRangeName);
         else if (status == "disabled")
         {
-            // Remove the configuration
-            SWSS_LOG_WARN("Removing configuration for time range %s -- STUB", timeRangeName.c_str());
+            task_status = disableTimeRange(timeRangeName);
         }
         else
         {
@@ -252,7 +283,7 @@ task_process_status ScheduledConfigMgr::enableTimeRange(const string &timeRangeN
     // Apply the configuration
     // scheduledConfigurations[timeRangeName].first is the configName
     // scheduledConfigurations[timeRangeName].second is the configuration JSON
-    SWSS_LOG_INFO("Applying configuration for time range %s", timeRangeName.c_str());
+    SWSS_LOG_INFO("Applying configurations for time range %s", timeRangeName.c_str());
 
     for (const auto &configData : scheduledConfigurations[timeRangeName])
     {
@@ -264,6 +295,38 @@ task_process_status ScheduledConfigMgr::enableTimeRange(const string &timeRangeN
             return task_process_status::task_need_retry;
         }
         SWSS_LOG_INFO("Applied configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
+    }
+        return task_process_status::task_success;
+}
+
+task_process_status ScheduledConfigMgr::disableTimeRange(const string &timeRangeName)
+{
+    SWSS_LOG_ENTER();
+
+    string configName{};
+
+    // Check if there are any configurations for the time range
+    if (scheduledConfigurations[timeRangeName].empty())
+    {
+        SWSS_LOG_INFO("No configuration found for time range %s", timeRangeName.c_str());
+        return task_process_status::task_success;
+    }
+
+    // Remove the configuration
+    // scheduledConfigurations[timeRangeName].first is the configName
+    // scheduledConfigurations[timeRangeName].second is the configuration JSON
+    SWSS_LOG_INFO("Removing configurations for time range %s", timeRangeName.c_str());
+
+    for (const auto &configData : scheduledConfigurations[timeRangeName])
+    {
+        configName = configData.first;
+        configJson = configData.second;
+        if (task_process_status::task_success != removeConfiguration(configName, configJson))
+        {
+            SWSS_LOG_ERROR("Could not remove configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
+            return task_process_status::task_need_retry;
+        }
+        SWSS_LOG_INFO("Removed configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
     }
         return task_process_status::task_success;
 }
