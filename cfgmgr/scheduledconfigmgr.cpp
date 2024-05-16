@@ -77,6 +77,19 @@ vector<FieldValueTuple> convertJsonToFieldValues(const json &jsonObj)
     return fieldValues;
 }
 
+bool ScheduledConfigMgr::isTimeRangeActive(const string &timeRangeName)
+{
+    SWSS_LOG_ENTER();
+    string status = "";
+
+    Table timeRangeStatusTable = reinterpret_cast<Table>(getExecutor(timeRangeName));
+    if (!timeRangeStatusTable.hget(timeRangeName, TIME_RANGE_STATUS_STR, status)){
+        SWSS_LOG_ERROR("Failed to get time range status for %s", timeRangeName.c_str());
+        return false;
+    }
+    return status==TIME_RANGE_ENABLED_STR;
+}
+
 bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, const json &tableKeyFields)
 {
     SWSS_LOG_ENTER();
@@ -198,8 +211,28 @@ task_process_status ScheduledConfigMgr::doProcessScheduledConfiguration(string t
             return task_process_status::task_failed;
         }
 
+        // Verify time range does not exist in the scheduledConfigurations hashmap        
+        if scheduledConfigurations[timeRangeName].find(scheduledConfigName) != scheduledConfigurations[timeRangeName].end())
+        {
+            SWSS_LOG_ERROR("Scheduled configuration %s already exists for time range %s", scheduledConfigName.c_str(), timeRangeName.c_str());
+            return task_process_status::task_failed;
+        }
+
+        // Add the configuration to the scheduledConfigurations hashmap
         scheduledConfigurations[timeRangeName].emplace_back(scheduledConfigName, configJson);
         SWSS_LOG_INFO("Successfully added %s to time range %s ", scheduledConfigName.c_str(), timeRangeName.c_str());
+
+        // Apply the configuration if the time range currrently is active
+        if (isTimeRangeActive(timeRangeName))
+        {
+            if (task_process_status::task_success != applyConfiguration(scheduledConfigName, configJson))
+            {
+                SWSS_LOG_ERROR("Could not apply configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
+                return task_process_status::task_need_retry;
+            }
+            SWSS_LOG_INFO("Applied configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
+        }
+
     }
     catch (const json::exception &e)
     {
@@ -235,6 +268,18 @@ task_process_status ScheduledConfigMgr::doProcessTimeRangeStatus(string timeRang
             SWSS_LOG_INFO("Time range %s is being created in the local db", timeRangeName.c_str());
             // Create the time range in the local db
             scheduledConfigurations[timeRangeName] = ConfigList{};
+
+            SWSS_LOG_INFO("Adding unbound configurations for time range %s", timeRangeName.c_str());
+            if (unboundConfigurations.find(timeRangeName) != unboundConfigurations.end())
+            {
+                for (const auto &configData : unboundConfigurations[timeRangeName])
+                {
+                    SWSS_LOG_NOTICE("Binding configuration %s to time range %s", configData.first.c_str(), timeRangeName.c_str());
+                    scheduledConfigurations[timeRangeName].emplace_back(configData);
+                }
+                unboundConfigurations.erase(timeRangeName);
+            }
+
             SWSS_LOG_INFO("Time range %s created in local db, will retry to decide what to do next", timeRangeName.c_str());
             return task_process_status::task_need_retry;
         }
@@ -359,12 +404,32 @@ void ScheduledConfigMgr::doTimeRangeTask(Consumer &consumer)
                 else
                 {
                     SWSS_LOG_ERROR("%s has unknown field %s", STATE_TIME_RANGE_STATUS_TABLE_NAME, fvField(i).c_str());
-                    // Can skip instead of returning invalid entry
                     task_status = task_process_status::task_invalid_entry;
+                    break;
                 }
             }
 
-            task_status = doProcessTimeRangeStatus(timeRangeName, status);
+            if (task_status != task_process_status::task_success)
+            {
+                task_status = doProcessTimeRangeStatus(timeRangeName, status);
+            }
+        } else if (op == DEL_COMMAND)
+        {
+            // Disable, and then remove the time range
+            if (scheduledConfigurations.find(timeRangeName) != scheduledConfigurations.end())
+            {
+                if (task_process_status::task_success != disableTimeRange(timeRangeName))
+                {
+                    SWSS_LOG_ERROR("Could not disable time range %s", timeRangeName.c_str());
+                    task_status = task_process_status::task_need_retry;
+                }
+                SWSS_LOG_INFO("Disabled time range %s", timeRangeName.c_str());
+            }
+            // Save configurations for future creation of time range
+            unboundConfigurations[timeRangeName] = scheduledConfigurations[timeRangeName];
+
+            // Remove time range
+            scheduledConfigurations.erase(timeRangeName);
         }
         switch (task_status)
         {
@@ -423,11 +488,25 @@ void ScheduledConfigMgr::doScheduledConfigurationTask(Consumer &consumer)
                 else
                 {
                     SWSS_LOG_ERROR("%s has unknown field %s", CFG_SCHEDULED_CONFIGURATION_TABLE_NAME, fvField(i).c_str());
-                    // Can skip instead of returning invalid entry
                     task_status = task_process_status::task_invalid_entry;
                 }
             }
-            task_status = doProcessScheduledConfiguration(timeRangeName, scheduledConfigurationName, configuration);
+            if (task_status != task_process_status::task_success)
+            {
+                task_status = doProcessScheduledConfiguration(timeRangeName, scheduledConfigurationName, configuration);
+            }
+        } else if (op == DEL_COMMAND)
+        {
+            // Remove the configuration
+            if (scheduledConfigurations.find(timeRangeName) != scheduledConfigurations.end())
+            {
+                if (task_process_status::task_success != removeConfiguration(scheduledConfigurationName, scheduledConfigurations[timeRangeName]))
+                {
+                    SWSS_LOG_ERROR("Could not remove configuration for time range %s, configName: %s", timeRangeName.c_str(), scheduledConfigurationName.c_str());
+                    task_status = task_process_status::task_need_retry;
+                }
+                SWSS_LOG_INFO("Removed configuration for time range %s, configName: %s", timeRangeName.c_str(), scheduledConfigurationName.c_str());
+            }
         }
 
         switch (task_status)
