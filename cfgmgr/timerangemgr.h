@@ -35,8 +35,8 @@ private:
     task_process_status writeCrontabFile(const std::string& fileName, const std::string& schedule, const std::string& command, bool deleteSelfAfterCompletion);
     task_process_status createCronjobs(const std::string& rangeName, const std::string& start, const std::string& end, bool runOnce);
     task_process_status doTimeRangeTask(const std::string& rangeName, const std::vector<FieldValueTuple>& fieldValues);
-    bool is_time_in_range(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::tm currentTime);
-    bool is_time_in_range(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::time_t  currentTime);
+    bool isTimeInRange(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::tm currentTM);
+    bool isTimeInRange(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::time_t currentTime);
     void doTask(Consumer &consumer);
 };
 

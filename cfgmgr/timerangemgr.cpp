@@ -20,17 +20,23 @@ TimeRangeMgr::TimeRangeMgr(DBConnector *cfgDb, DBConnector *stateDb, const vecto
 }
 
 
-bool is_time_in_range(const cronexpr& startExpr, const cronexpr& endExpr, const std::tm& currentTM) {
+bool TimeRangeMgr::isTimeInRange(const cronexpr& startExpr, const cronexpr& endExpr, const std::tm& currentTM) {
     std::time_t currentTime = mktime(const_cast<tm*>(&currentTM)); // Convert currentTM to time_t
-    time_t previousMinute = currentTime - 60; // Go back one minute to ensure full coverage
+    
+    // Call the other isTimeInRange function with the time_t version of current time
+    return this->isTimeInRange(startExpr, endExpr, currentTime);
+}
 
-    // Convert back to tm
-    tm* prevTM = localtime(&previousMinute);
+bool TimeRangeMgr::isTimeInRange(const cronexpr& startExpr, const cronexpr& endExpr, const std::time_t& currentTime) {
+    
+    // Find the next occurrence of the start time after the current time
+    std::time_t nextStartTime = cron_next(startExpr, currentTime);
 
-    time_t nextStartTime = cron_previous(startExpr, mktime(prevTM));
-    time_t nextEndTime = cron_next(endExpr, mktime(prevTM));
+    // Find the next occurrence of the end time after the current time
+    std::time_t nextEndTime = cron_next(endExpr, currentTime);
 
-    return (currentTime >= nextStartTime && currentTime < nextEndTime);
+    // Check if we are currently in the time range
+    return (nextStartTime > nextEndTime);
 }
 
 task_process_status TimeRangeMgr::writeCrontabFile(const string &fileName, const string &schedule, const string &command, bool deleteSelfAfterCompletion)
@@ -164,10 +170,8 @@ task_process_status TimeRangeMgr::doTimeRangeTask(const string &rangeName, const
 
 
     time_t currentTime = time(nullptr);
-    localtime_r(&currentTime, &currentTM);
 
-
-    if (is_time_in_range(startExpr, endExpr, currentTM))
+    if (isTimeInRange(startExpr, endExpr, currentTime))
     {
         SWSS_LOG_INFO("Time range %s is active", rangeName.c_str());
         time_range_default_status = TIME_RANGE_ENABLED_STR;
