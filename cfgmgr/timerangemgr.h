@@ -14,8 +14,8 @@
 
 namespace swss {
 
-#define TIME_RANGE_ENABLED_STR "enabled"
-#define TIME_RANGE_DISABLED_STR "disabled"
+#define TIME_RANGE_ACTIVE_STR "active"
+#define TIME_RANGE_INACTIVE_STR "inactive"
 #define TIME_RANGE_STATUS_STR "status"
 
 
@@ -34,10 +34,12 @@ private:
 
     task_process_status writeCrontabFile(const std::string& fileName, const std::string& schedule, const std::string& command, bool deleteSelfAfterCompletion);
     task_process_status createCronjobs(const std::string& rangeName, const std::string& start, const std::string& end, bool runOnce);
-    task_process_status doTimeRangeTask(const std::string& rangeName, const std::vector<FieldValueTuple>& fieldValues);
-    bool isTimeInRange(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::tm currentTM);
-    bool isTimeInRange(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::time_t currentTime);
+    bool isTimeInRange(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::tm& currentTM);
+    bool isTimeInRange(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::time_t& currentTime);
+    
     void doTask(Consumer &consumer);
+    task_process_status doTimeRangeTask(const std::string& rangeName, const std::vector<FieldValueTuple>& fieldValues);
+    task_process_status doTimeRangeTaskDelete(const std::string &rangeName);
 };
 
 }
