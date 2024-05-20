@@ -8,7 +8,6 @@
 #include "timerangemgr.h"
 #include "tokenize.h"
 #include <table.h>
-#include "croncpp.h"
 
 using namespace std;
 using namespace swss;
@@ -70,10 +69,10 @@ task_process_status TimeRangeMgr::createCronjobs(const string &taskName, const s
     string disableCrontabName = taskName + "-disable";
 
     // Create command for enabling the task
-    string command_enabled = string("/usr/bin/redis-cli -n ") + to_string(STATE_DB) + " HSET '" + STATE_TIME_RANGE_STATUS_TABLE_NAME + "|" + taskName + "' '" + TIME_RANGE_STATUS_STR + "' '" + TIME_RANGE_ENABLED_STR + "'";
+    string command_enabled = string("/usr/bin/redis-cli -n ") + to_string(STATE_DB) + " HSET '" + STATE_TIME_RANGE_STATUS_TABLE_NAME + "|" + taskName + "' '" + TIME_RANGE_STATUS_STR + "' '" + TIME_RANGE_ACTIVE_STR + "'";
 
     // Create command for disabling the task
-    string command_disabled = string("/usr/bin/redis-cli -n ") + to_string(STATE_DB) + " HSET '" + STATE_TIME_RANGE_STATUS_TABLE_NAME + "|" + taskName + "' '" + TIME_RANGE_STATUS_STR + "' '" + TIME_RANGE_DISABLED_STR + "'";
+    string command_disabled = string("/usr/bin/redis-cli -n ") + to_string(STATE_DB) + " HSET '" + STATE_TIME_RANGE_STATUS_TABLE_NAME + "|" + taskName + "' '" + TIME_RANGE_STATUS_STR + "' '" + TIME_RANGE_INACTIVE_STR + "'";
     if (runOnce)
     {
         // Delete the time range configuration entry after the task has been disabled
@@ -97,6 +96,7 @@ task_process_status TimeRangeMgr::createCronjobs(const string &taskName, const s
 
     return task_process_status::task_success;
 }
+
 task_process_status TimeRangeMgr::doTimeRangeTaskDelete(const string &rangeName)
 {
     SWSS_LOG_ENTER();
@@ -165,8 +165,7 @@ task_process_status TimeRangeMgr::doTimeRangeTask(const string &rangeName, const
     // Check if time range should be active by default
     auto startExpr = make_cron(start);
     auto endExpr = make_cron(end);
-    tm currentTM;
-    string time_range_default_status = TIME_RANGE_DISABLED_STR;
+    string time_range_default_status = TIME_RANGE_INACTIVE_STR;
 
 
     time_t currentTime = time(nullptr);
@@ -174,7 +173,7 @@ task_process_status TimeRangeMgr::doTimeRangeTask(const string &rangeName, const
     if (isTimeInRange(startExpr, endExpr, currentTime))
     {
         SWSS_LOG_INFO("Time range %s is active", rangeName.c_str());
-        time_range_default_status = TIME_RANGE_ENABLED_STR;
+        time_range_default_status = TIME_RANGE_ACTIVE_STR;
     }
 
     // Prepare state table field-values
