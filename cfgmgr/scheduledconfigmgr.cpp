@@ -82,12 +82,17 @@ bool ScheduledConfigMgr::isTimeRangeActive(const string &timeRangeName)
     SWSS_LOG_ENTER();
     string status = "";
 
-    Table timeRangeStatusTable = reinterpret_cast<Table>(getExecutor(timeRangeName));
-    if (!timeRangeStatusTable.hget(timeRangeName, TIME_RANGE_STATUS_STR, status)){
+    Table* timeRangeStatusTable = dynamic_cast<Table *>(getExecutor(timeRangeName));
+    if (!timeRangeStatusTable->hget(timeRangeName, "status", status)){
         SWSS_LOG_ERROR("Failed to get time range status for %s", timeRangeName.c_str());
+        delete timeRangeStatusTable;
+        timeRangeStatusTable = nullptr;
         return false;
     }
-    return status==TIME_RANGE_ENABLED_STR;
+    delete timeRangeStatusTable;
+    timeRangeStatusTable = nullptr;
+    
+    return status=="active";
 }
 
 bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, const json &tableKeyFields)
@@ -212,7 +217,7 @@ task_process_status ScheduledConfigMgr::doProcessScheduledConfiguration(string t
         }
 
         // Verify time range does not exist in the scheduledConfigurations hashmap        
-        if scheduledConfigurations[timeRangeName].find(scheduledConfigName) != scheduledConfigurations[timeRangeName].end())
+        if (scheduledConfigurations[timeRangeName].find(scheduledConfigName) != scheduledConfigurations[timeRangeName].end())
         {
             SWSS_LOG_ERROR("Scheduled configuration %s already exists for time range %s", scheduledConfigName.c_str(), timeRangeName.c_str());
             return task_process_status::task_failed;
@@ -227,10 +232,10 @@ task_process_status ScheduledConfigMgr::doProcessScheduledConfiguration(string t
         {
             if (task_process_status::task_success != applyConfiguration(scheduledConfigName, configJson))
             {
-                SWSS_LOG_ERROR("Could not apply configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
+                SWSS_LOG_ERROR("Could not apply configuration for time range %s, configName: %s", timeRangeName.c_str(), scheduledConfigName.c_str());
                 return task_process_status::task_need_retry;
             }
-            SWSS_LOG_INFO("Applied configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
+            SWSS_LOG_INFO("Applied configuration for time range %s, configName: %s", timeRangeName.c_str(), scheduledConfigName.c_str());
         }
 
     }
@@ -349,6 +354,7 @@ task_process_status ScheduledConfigMgr::disableTimeRange(const string &timeRange
     SWSS_LOG_ENTER();
 
     string configName{};
+    json configJson{};
 
     // Check if there are any configurations for the time range
     if (scheduledConfigurations[timeRangeName].empty())
