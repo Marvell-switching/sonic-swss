@@ -128,6 +128,8 @@ task_process_status TimeRangeMgr::doTimeRangeTask(const string &rangeName, const
     string end = "";
     string runOnce = "";
 
+    cron::detail::replace_ordinals("", vector<string>{});
+
     for (const auto &i : fieldValues)
     {
         if (fvField(i) == "start")
@@ -163,17 +165,22 @@ task_process_status TimeRangeMgr::doTimeRangeTask(const string &rangeName, const
     }
 
     // Check if time range should be active by default
-    auto startExpr = make_cron(start);
-    auto endExpr = make_cron(end);
     string time_range_default_status = TIME_RANGE_INACTIVE_STR;
-
-
-    time_t currentTime = time(nullptr);
-
-    if (isTimeInRange(startExpr, endExpr, currentTime))
+    try 
     {
-        SWSS_LOG_INFO("Time range %s is active", rangeName.c_str());
-        time_range_default_status = TIME_RANGE_ACTIVE_STR;
+        auto startExpr = make_cron(start);
+        auto endExpr = make_cron(end);
+
+        time_t currentTime = time(nullptr);
+
+        if (isTimeInRange(startExpr, endExpr, currentTime))
+        {
+            SWSS_LOG_INFO("Time range %s is active", rangeName.c_str());
+            time_range_default_status = TIME_RANGE_ACTIVE_STR;
+        }
+    } catch (bad_cronexpr const & ex)
+    {
+        SWSS_LOG_WARN("%s", ex.what());
     }
 
     // Prepare state table field-values
