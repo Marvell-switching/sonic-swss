@@ -10,11 +10,10 @@
 #include <vector>
 
 using json = nlohmann::json;
+
 // Define a type alias for the configuration data structure
-using ConfigData = std::pair<std::string, json>; // Pair of configName and configuration JSON object
-// using ConfigData = std::tuple<std::string, std::string, json>; // Tuple of configName, configType, and configuration JSON object
-using ConfigList = std::vector<ConfigData>; // A list of configurations
-using TimeRangeConfigMap = std::unordered_map<std::string, ConfigList>; // Maps time range names to lists of configurations
+using ConfigData = std::unordered_map<std::string, json>; // Maps configName to JSON object
+using TimeRangeConfigMap = std::unordered_map<std::string, ConfigData>; // Maps time range names to map of config data
 
 namespace swss {
 

@@ -373,8 +373,9 @@ namespace cron
             throw bad_cronexpr(ex.what());
          }
       }
-
-      std::string replace_ordinals(
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+      static std::string replace_ordinals(
           std::string text,
           std::vector<std::string> const &replacement)
       {
@@ -387,6 +388,7 @@ namespace cron
 
          return text;
       }
+#pragma GCC diagnostic pop
 
       static std::pair<cron_int, cron_int> make_range(
           CRONCPP_STRING_VIEW field,
@@ -538,7 +540,7 @@ namespace cron
           std::bitset<12> &target)
       {
          auto month = utils::to_upper(value);
-         auto month_replaced = replace_ordinals(
+         auto month_replaced = detail::replace_ordinals(
              month,
 #ifdef CRONCPP_IS_CPP17
              Traits::MONTHS
