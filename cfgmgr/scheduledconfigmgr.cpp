@@ -224,7 +224,7 @@ task_process_status ScheduledConfigMgr::doProcessScheduledConfiguration(string t
         }
 
         // Add the configuration to the scheduledConfigurations hashmap
-        scheduledConfigurations[timeRangeName].emplace_back(scheduledConfigName, configJson);
+        scheduledConfigurations[timeRangeName][scheduledConfigName] =  configJson;
         SWSS_LOG_INFO("Successfully added %s to time range %s ", scheduledConfigName.c_str(), timeRangeName.c_str());
 
         // Apply the configuration if the time range currrently is active
@@ -271,8 +271,8 @@ task_process_status ScheduledConfigMgr::doProcessTimeRangeStatus(string timeRang
         if (scheduledConfigurations.find(timeRangeName) == scheduledConfigurations.end())
         {
             SWSS_LOG_INFO("Time range %s is being created in the local db", timeRangeName.c_str());
-            // Create the time range in the local db
-            scheduledConfigurations[timeRangeName] = ConfigList{};
+            // Create the time range in the local db with default value
+            scheduledConfigurations[timeRangeName];
 
             SWSS_LOG_INFO("Adding unbound configurations for time range %s", timeRangeName.c_str());
             if (unboundConfigurations.find(timeRangeName) != unboundConfigurations.end())
@@ -280,7 +280,7 @@ task_process_status ScheduledConfigMgr::doProcessTimeRangeStatus(string timeRang
                 for (const auto &configData : unboundConfigurations[timeRangeName])
                 {
                     SWSS_LOG_NOTICE("Binding configuration %s to time range %s", configData.first.c_str(), timeRangeName.c_str());
-                    scheduledConfigurations[timeRangeName].emplace_back(configData);
+                    scheduledConfigurations[timeRangeName].insert(configData);
                 }
                 unboundConfigurations.erase(timeRangeName);
             }
