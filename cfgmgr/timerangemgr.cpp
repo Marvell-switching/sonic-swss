@@ -168,8 +168,13 @@ task_process_status TimeRangeMgr::doTimeRangeTask(const string &rangeName, const
     string time_range_default_status = TIME_RANGE_INACTIVE_STR;
     try 
     {
-        auto startExpr = make_cron(start);
-        auto endExpr = make_cron(end);
+        // croncpp.h uses nonstandard "seconds" field. Add "0 " to the beginning of the cron expression.
+        // This is a workaround to avoid using seconds field.
+        // TODO To make croncpp more efficient for standard cron use, remove seconds field from croncpp.h
+        auto startSeconds = string("0 ") + start;
+        auto endSeconds = string("0 ") + end;
+        auto startExpr = make_cron(startSeconds);
+        auto endExpr = make_cron(endSeconds);
 
         time_t currentTime = time(nullptr);
 
