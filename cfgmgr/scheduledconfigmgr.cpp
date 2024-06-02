@@ -19,6 +19,35 @@ ScheduledConfigMgr::ScheduledConfigMgr(vector<TableConnector> &connectors, DBCon
     m_appDb = appDb;
 }
 
+string ScheduledConfigMgr::findTimeRangeByConfiguration(string scheduledConfigurationName) {
+    for (const auto& pair : scheduledConfigurations) {
+        const std::string& timeRangeName = pair.first;
+        const ConfigData& configDataMap = pair.second;
+        
+        // Check if the scheduledConfigurationName exists in the inner ConfigData map
+        if (configDataMap.find(scheduledConfigurationName) != configDataMap.end()) {
+            return timeRangeName;
+        }
+    }
+    return ""; // Return an empty string if not found
+}
+
+DBConnector* ScheduledConfigMgr::getDBConnector(const string &tableName){
+
+    Consumer* tableConsumer = static_cast<Consumer *>(getExecutor(tableName));
+    if (!tableConsumer)
+    {
+        SWSS_LOG_ERROR("Failed to get consumer for %s", tableName.c_str());
+        return nullptr;
+    }
+    DBConnector* tableDBConnector = const_cast<DBConnector*>(tableConsumer->getDbConnector());
+    if (!tableDBConnector) {
+        SWSS_LOG_ERROR("Failed to get DB connector for %s", tableName.c_str());
+        return nullptr;
+    }
+    return tableDBConnector;
+}
+
 string join(const json &jsonArray, const string &delimiter)
 {
     string result;
@@ -80,19 +109,20 @@ vector<FieldValueTuple> convertJsonToFieldValues(const json &jsonObj)
 bool ScheduledConfigMgr::isTimeRangeActive(const string &timeRangeName)
 {
     SWSS_LOG_ENTER();
-    string status = "";
+    shared_ptr<string> statusPtr{};
+    string key = "";
+    DBConnector* timeRangeStatusDBConnector = getDBConnector(STATE_TIME_RANGE_STATUS_TABLE_NAME);
+    if (!timeRangeStatusDBConnector)
+        return false;
 
-    Table* timeRangeStatusTable = dynamic_cast<Table *>(getExecutor(timeRangeName));
-    if (!timeRangeStatusTable->hget(timeRangeName, "status", status)){
+    key = STATE_TIME_RANGE_STATUS_TABLE_NAME +  SonicDBConfig::getSeparator(timeRangeStatusDBConnector) + timeRangeName;
+    statusPtr = timeRangeStatusDBConnector->hget(key, "status");
+    if (!statusPtr){
         SWSS_LOG_ERROR("Failed to get time range status for %s", timeRangeName.c_str());
-        delete timeRangeStatusTable;
-        timeRangeStatusTable = nullptr;
         return false;
     }
-    delete timeRangeStatusTable;
-    timeRangeStatusTable = nullptr;
     
-    return status=="active";
+    return *statusPtr=="active";
 }
 
 bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, const json &tableKeyFields)
@@ -123,7 +153,7 @@ bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, c
     return true;
 }
 
-bool ScheduledConfigMgr::removeTableConfiguration(const std::string &tableName)
+bool ScheduledConfigMgr::removeTableConfiguration(const string &tableName, const string &key)
 {
     SWSS_LOG_ENTER();
 
@@ -131,11 +161,11 @@ bool ScheduledConfigMgr::removeTableConfiguration(const std::string &tableName)
     ProducerStateTable tableObj(m_appDb, tableName);
 
     // Create a Table object and set the field values
-    tableObj.clear();
+    tableObj.del(key);
     return true;
 }
 
-task_process_status ScheduledConfigMgr::applyConfiguration(const std::string &configName, const json &configJson)
+task_process_status ScheduledConfigMgr::applyConfiguration(const string &configName, const json &configJson)
 {
     SWSS_LOG_ENTER();
 
@@ -154,18 +184,35 @@ task_process_status ScheduledConfigMgr::applyConfiguration(const std::string &co
     return task_process_status::task_success;
 }
 
-task_process_status ScheduledConfigMgr::removeConfiguration(const std::string &configName, const json &configJson)
+task_process_status ScheduledConfigMgr::removeConfiguration(const string &configName, const json &configJson)
 {
     SWSS_LOG_ENTER();
-    string tableName = "";
+    std::string tableName;
+    std::string key;
 
-    for (const auto &tableEntry : configJson.items())
-    {
-        tableName = tableEntry.key();
+    for (const auto &tableEntry : configJson.items()) {
+        tableName = tableEntry.key(); // e.g., "ACL_TABLE_TABLE" or "ACL_TABLE_TABLE:ACL_TABLE_NAME"
+        const json &innerObject = tableEntry.value();
 
-        if (!removeTableConfiguration(tableName))
-        {
-            SWSS_LOG_ERROR("Failed to remove configuration %s for table: %s", configName.c_str(), tableName.c_str());
+        // Check if the outer key already contains the entire table name and key
+        size_t pos = tableName.find(':');
+        if (pos != std::string::npos) {
+            key = tableName.substr(pos + 1); // Extract the key part after ':'
+            tableName = tableName.substr(0, pos); // Extract the table name part before ':'
+        } else if (innerObject.is_object()) {
+            // Iterate through the inner object to get the key
+            for (const auto &innerEntry : innerObject.items()) {
+                key = innerEntry.key(); // e.g., "ACL_TABLE_NAME"
+                break; // We only need the first key for this function
+            }
+        } else {
+            SWSS_LOG_ERROR("Expected JSON object for key: %s", tableName.c_str());
+            return task_process_status::task_failed;
+        }
+
+        // Call removeTableConfiguration with the parsed tableName and key
+        if (!removeTableConfiguration(tableName, key)) {
+            SWSS_LOG_ERROR("Failed to remove configuration %s for table: %s with key: %s", configName.c_str(), tableName.c_str(), key.c_str());
             return task_process_status::task_failed;
         }
     }
@@ -195,7 +242,6 @@ task_process_status ScheduledConfigMgr::doProcessScheduledConfiguration(string t
 
     try
     {
-
         // Parse the configuration string into a JSON object for validation
         // Assuming the configuration is in a JSON string format
         SWSS_LOG_DEBUG("===JSON CONFIGURATION STRING BEFORE PROCESS===");
@@ -227,7 +273,7 @@ task_process_status ScheduledConfigMgr::doProcessScheduledConfiguration(string t
         scheduledConfigurations[timeRangeName][scheduledConfigName] =  configJson;
         SWSS_LOG_INFO("Successfully added %s to time range %s ", scheduledConfigName.c_str(), timeRangeName.c_str());
 
-        // Apply the configuration if the time range currrently is active
+        // Apply the configuration if the time range currently is active
         if (isTimeRangeActive(timeRangeName))
         {
             if (task_process_status::task_success != applyConfiguration(scheduledConfigName, configJson))
@@ -235,9 +281,13 @@ task_process_status ScheduledConfigMgr::doProcessScheduledConfiguration(string t
                 SWSS_LOG_ERROR("Could not apply configuration for time range %s, configName: %s", timeRangeName.c_str(), scheduledConfigName.c_str());
                 return task_process_status::task_need_retry;
             }
+            // Add the configuration to the scheduledConfigurationStatus hashmap with status true
+            scheduledConfigurationStatus[scheduledConfigName] = true;
             SWSS_LOG_INFO("Applied configuration for time range %s, configName: %s", timeRangeName.c_str(), scheduledConfigName.c_str());
+        } else {
+            // Add the configuration to the scheduledConfigurationStatus hashmap with status false
+            scheduledConfigurationStatus[scheduledConfigName] = false;
         }
-
     }
     catch (const json::exception &e)
     {
@@ -290,9 +340,10 @@ task_process_status ScheduledConfigMgr::doProcessTimeRangeStatus(string timeRang
         }
 
         // If the time range exists, apply the configuration based on the status
-        if (status == "enabled")
+        if (status == "active"){
             task_status = enableTimeRange(timeRangeName);
-        else if (status == "disabled")
+        }
+        else if (status == "inactive")
         {
             task_status = disableTimeRange(timeRangeName);
         }
@@ -344,6 +395,7 @@ task_process_status ScheduledConfigMgr::enableTimeRange(const string &timeRangeN
             SWSS_LOG_ERROR("Could not apply configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
             return task_process_status::task_need_retry;
         }
+        scheduledConfigurationStatus[configName] = true;
         SWSS_LOG_INFO("Applied configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
     }
         return task_process_status::task_success;
@@ -377,6 +429,7 @@ task_process_status ScheduledConfigMgr::disableTimeRange(const string &timeRange
             SWSS_LOG_ERROR("Could not remove configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
             return task_process_status::task_need_retry;
         }
+        scheduledConfigurationStatus[configName] = false;
         SWSS_LOG_INFO("Removed configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
     }
         return task_process_status::task_success;
@@ -415,7 +468,7 @@ void ScheduledConfigMgr::doTimeRangeTask(Consumer &consumer)
                 }
             }
 
-            if (task_status != task_process_status::task_success)
+            if (task_status == task_process_status::task_success)
             {
                 task_status = doProcessTimeRangeStatus(timeRangeName, status);
             }
@@ -497,21 +550,33 @@ void ScheduledConfigMgr::doScheduledConfigurationTask(Consumer &consumer)
                     task_status = task_process_status::task_invalid_entry;
                 }
             }
-            if (task_status != task_process_status::task_success)
+            if (task_status == task_process_status::task_success)
             {
                 task_status = doProcessScheduledConfiguration(timeRangeName, scheduledConfigurationName, configuration);
             }
         } else if (op == DEL_COMMAND)
         {
-            // Remove the configuration
-            if (scheduledConfigurations.find(timeRangeName) != scheduledConfigurations.end())
-            {
-                if (task_process_status::task_success != removeConfiguration(scheduledConfigurationName, scheduledConfigurations[timeRangeName]))
-                {
-                    SWSS_LOG_ERROR("Could not remove configuration for time range %s, configName: %s", timeRangeName.c_str(), scheduledConfigurationName.c_str());
-                    task_status = task_process_status::task_need_retry;
+            if (scheduledConfigurationStatus.find(scheduledConfigurationName) != scheduledConfigurationStatus.end()){
+                if (scheduledConfigurationStatus[scheduledConfigurationName]){
+                    // Get scheduled configuration time range name
+                    timeRangeName = findTimeRangeByConfiguration(scheduledConfigurationName);
+
+                    // Remove the configuration
+                    if (scheduledConfigurations.find(timeRangeName) != scheduledConfigurations.end())
+                    {
+                        if (task_process_status::task_success != removeConfiguration(scheduledConfigurationName, scheduledConfigurations[timeRangeName][scheduledConfigurationName]))
+                        {
+                            SWSS_LOG_ERROR("Could not remove configuration for time range %s, configName: %s", timeRangeName.c_str(), scheduledConfigurationName.c_str());
+                            task_status = task_process_status::task_need_retry;
+                        }
+                        scheduledConfigurationStatus.erase(scheduledConfigurationName);
+                        scheduledConfigurations[timeRangeName].erase(scheduledConfigurationName);
+                        SWSS_LOG_INFO("Removed configuration for time range %s, configName: %s", timeRangeName.c_str(), scheduledConfigurationName.c_str());
+                    }
                 }
-                SWSS_LOG_INFO("Removed configuration for time range %s, configName: %s", timeRangeName.c_str(), scheduledConfigurationName.c_str());
+            } else {
+                SWSS_LOG_ERROR("Scheduled configuration %s does not exist", scheduledConfigurationName.c_str());
+                task_status = task_process_status::task_failed;
             }
         }
 
@@ -519,6 +584,7 @@ void ScheduledConfigMgr::doScheduledConfigurationTask(Consumer &consumer)
         {
         case task_process_status::task_failed:
             SWSS_LOG_ERROR("Failed to process table update");
+            it = consumer.m_toSync.erase(it);
             return;
         case task_process_status::task_need_retry:
             SWSS_LOG_INFO("Unable to process table update. Will retry...");
