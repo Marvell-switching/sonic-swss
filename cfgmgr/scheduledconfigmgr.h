@@ -12,6 +12,7 @@
 using json = nlohmann::json;
 
 // Define a type alias for the configuration data structure
+using ConfigStatus = std::unordered_map<std::string, bool>; // Maps configName to config status boolean
 using ConfigData = std::unordered_map<std::string, json>; // Maps configName to JSON object
 using TimeRangeConfigMap = std::unordered_map<std::string, ConfigData>; // Maps time range names to map of config data
 
@@ -26,6 +27,11 @@ public:
 private:
     DBConnector *m_appDb;
     TimeRangeConfigMap scheduledConfigurations, unboundConfigurations;
+    ConfigStatus scheduledConfigurationStatus;
+
+    // Helper Functions
+    DBConnector* getDBConnector(const std::string &tableName);
+    std::string findTimeRangeByConfiguration(std::string scheduledConfigurationName);
 
     // Validation Functions
     bool validateConfiguration(const json &configJson);
@@ -38,7 +44,7 @@ private:
 
     task_process_status disableTimeRange(const std::string &timeRangeName);
     task_process_status removeConfiguration(const std::string &configName, const json &configJson);
-    bool removeTableConfiguration(const std::string &tableName);
+    bool removeTableConfiguration(const std::string &tableName, const std::string &key);
     
     // Task Processing Functions
     task_process_status doProcessScheduledConfiguration(std::string timeRangeName, std::string configType, std::string configuration);
