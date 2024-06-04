@@ -32,10 +32,10 @@ public:
 private:
     Table m_stateTimeRangeStatusTable;
 
-    task_process_status writeCrontabFile(const std::string& fileName, const std::string& schedule, const std::string& command, bool deleteSelfAfterCompletion);
-    task_process_status createCronjobs(const std::string& rangeName, const std::string& start, const std::string& end, bool runOnce);
-    bool isTimeInRange(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::tm& currentTM);
-    bool isTimeInRange(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::time_t& currentTime);
+    task_process_status writeCrontabFile(const std::string& fileName, const std::string& schedule, const std::string& command);
+    task_process_status createCronjobs(const std::string& rangeName, const std::string& start, const std::string& end, const std::string& startYear, const std::string& endYear);
+    bool isTimeInRange(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::tm& currentTM, const std::string& startYear, const std::string& endYear);
+    bool isTimeInRange(const cron::cronexpr& startExpr, const cron::cronexpr& endExpr, const std::time_t& currentTime, const std::string& startYear, const std::string& endYear);
     
     void doTask(Consumer &consumer);
     task_process_status doTimeRangeTask(const std::string& rangeName, const std::vector<FieldValueTuple>& fieldValues);

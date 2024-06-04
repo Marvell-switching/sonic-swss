@@ -64,7 +64,6 @@ namespace cron
    {
       enum class cron_field
       {
-         second,
          minute,
          hour_of_day,
          day_of_week,
@@ -89,9 +88,6 @@ namespace cron
 
    struct cron_standard_traits
    {
-      static const cron_int CRON_MIN_SECONDS = 0;
-      static const cron_int CRON_MAX_SECONDS = 59;
-
       static const cron_int CRON_MIN_MINUTES = 0;
       static const cron_int CRON_MAX_MINUTES = 59;
 
@@ -129,9 +125,6 @@ namespace cron
 
    struct cron_oracle_traits
    {
-      static const cron_int CRON_MIN_SECONDS = 0;
-      static const cron_int CRON_MAX_SECONDS = 59;
-
       static const cron_int CRON_MIN_MINUTES = 0;
       static const cron_int CRON_MAX_MINUTES = 59;
 
@@ -170,9 +163,6 @@ namespace cron
 
    struct cron_quartz_traits
    {
-      static const cron_int CRON_MIN_SECONDS = 0;
-      static const cron_int CRON_MAX_SECONDS = 59;
-
       static const cron_int CRON_MIN_MINUTES = 0;
       static const cron_int CRON_MAX_MINUTES = 59;
 
@@ -215,7 +205,6 @@ namespace cron
 
    class cronexpr
    {
-      std::bitset<60> seconds;
       std::bitset<60> minutes;
       std::bitset<24> hours;
       std::bitset<7> days_of_week;
@@ -240,8 +229,7 @@ namespace cron
 
    inline bool operator==(cronexpr const &e1, cronexpr const &e2)
    {
-      return e1.seconds == e2.seconds &&
-             e1.minutes == e2.minutes &&
+      return e1.minutes == e2.minutes &&
              e1.hours == e2.hours &&
              e1.days_of_week == e2.days_of_week &&
              e1.days_of_month == e2.days_of_month &&
@@ -255,8 +243,7 @@ namespace cron
 
    inline std::string to_string(cronexpr const &cex)
    {
-      return cex.seconds.to_string() + " " +
-             cex.minutes.to_string() + " " +
+      return cex.minutes.to_string() + " " +
              cex.hours.to_string() + " " +
              cex.days_of_month.to_string() + " " +
              cex.months.to_string() + " " +
@@ -579,9 +566,6 @@ namespace cron
       {
          switch (field)
          {
-         case cron_field::second:
-            date.tm_sec += val;
-            break;
          case cron_field::minute:
             date.tm_min += val;
             break;
@@ -613,9 +597,6 @@ namespace cron
       {
          switch (field)
          {
-         case cron_field::second:
-            date.tm_sec = val;
-            break;
          case cron_field::minute:
             date.tm_min = val;
             break;
@@ -648,9 +629,6 @@ namespace cron
       {
          switch (field)
          {
-         case cron_field::second:
-            date.tm_sec = 0;
-            break;
          case cron_field::minute:
             date.tm_min = 0;
             break;
@@ -679,7 +657,7 @@ namespace cron
 
       inline void reset_all_fields(
           std::tm &date,
-          std::bitset<7> const &marked_fields)
+          std::bitset<6> const &marked_fields)
       {
          for (size_t i = 0; i < marked_fields.size(); ++i)
          {
@@ -689,7 +667,7 @@ namespace cron
       }
 
       inline void mark_field(
-          std::bitset<7> &orders,
+          std::bitset<6> &orders,
           cron_field const field)
       {
          if (!orders.test(static_cast<size_t>(field)))
@@ -705,7 +683,7 @@ namespace cron
           unsigned int const value,
           cron_field const field,
           cron_field const next_field,
-          std::bitset<7> const &marked_fields)
+          std::bitset<6> const &marked_fields)
       {
          auto next_value = next_set_bit(target, minimum, maximum, value);
          if (INVALID_INDEX == next_value)
@@ -731,7 +709,7 @@ namespace cron
           size_t day_of_month,
           std::bitset<7> const &days_of_week,
           size_t day_of_week,
-          std::bitset<7> const &marked_fields)
+          std::bitset<6> const &marked_fields)
       {
          unsigned int count = 0;
          unsigned int maximum = 366;
@@ -758,24 +736,8 @@ namespace cron
       {
          bool res = true;
 
-         std::bitset<7> marked_fields{0};
-         std::bitset<7> empty_list{0};
-
-         unsigned int second = date.tm_sec;
-         auto updated_second = find_next(
-             cex.seconds,
-             date,
-             Traits::CRON_MIN_SECONDS,
-             Traits::CRON_MAX_SECONDS,
-             second,
-             cron_field::second,
-             cron_field::minute,
-             empty_list);
-
-         if (second == updated_second)
-         {
-            mark_field(marked_fields, cron_field::second);
-         }
+         std::bitset<6> marked_fields{0};
+         std::bitset<6> empty_list{0};
 
          unsigned int minute = date.tm_min;
          auto update_minute = find_next(
@@ -877,18 +839,17 @@ namespace cron
                          [](CRONCPP_STRING_VIEW s)
                          { return s.empty(); }),
           std::end(fields));
-      if (fields.size() != 6)
-         throw bad_cronexpr("cron expression must have six fields");
+      if (fields.size() != 5)
+         throw bad_cronexpr("cron expression must have five fields");
 
-      detail::set_cron_field(fields[0], cex.seconds, Traits::CRON_MIN_SECONDS, Traits::CRON_MAX_SECONDS);
-      detail::set_cron_field(fields[1], cex.minutes, Traits::CRON_MIN_MINUTES, Traits::CRON_MAX_MINUTES);
-      detail::set_cron_field(fields[2], cex.hours, Traits::CRON_MIN_HOURS, Traits::CRON_MAX_HOURS);
+      detail::set_cron_field(fields[0], cex.minutes, Traits::CRON_MIN_MINUTES, Traits::CRON_MAX_MINUTES);
+      detail::set_cron_field(fields[1], cex.hours, Traits::CRON_MIN_HOURS, Traits::CRON_MAX_HOURS);
 
-      detail::set_cron_days_of_week<Traits>(fields[5], cex.days_of_week);
+      detail::set_cron_days_of_week<Traits>(fields[4], cex.days_of_week);
 
-      detail::set_cron_days_of_month<Traits>(fields[3], cex.days_of_month);
+      detail::set_cron_days_of_month<Traits>(fields[2], cex.days_of_month);
 
-      detail::set_cron_month<Traits>(fields[4], cex.months);
+      detail::set_cron_month<Traits>(fields[3], cex.months);
 
       cex.expr = expr;
 
@@ -911,7 +872,7 @@ namespace cron
 
       if (calculated == original)
       {
-         add_to_field(date, detail::cron_field::second, 1);
+         add_to_field(date, detail::cron_field::minute, 1);
          if (!detail::find_next<Traits>(cex, date, date.tm_year))
             return {};
       }
@@ -940,7 +901,7 @@ namespace cron
 
       if (calculated == original)
       {
-         add_to_field(*dt, detail::cron_field::second, 1);
+         add_to_field(*dt, detail::cron_field::minute, 1);
          if (!detail::find_next<Traits>(cex, *dt, dt->tm_year))
             return INVALID_TIME;
       }

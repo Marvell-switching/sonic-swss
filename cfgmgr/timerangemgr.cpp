@@ -19,26 +19,47 @@ TimeRangeMgr::TimeRangeMgr(DBConnector *cfgDb, DBConnector *stateDb, const vecto
 }
 
 
-bool TimeRangeMgr::isTimeInRange(const cronexpr& startExpr, const cronexpr& endExpr, const std::tm& currentTM) {
-    std::time_t currentTime = mktime(const_cast<tm*>(&currentTM)); // Convert currentTM to time_t
+bool TimeRangeMgr::isTimeInRange(const cronexpr& startExpr, const cronexpr& endExpr, const tm& currentTM, const string& startYear = "", const string& endYear = "") {
+    time_t currentTime = mktime(const_cast<tm*>(&currentTM)); // Convert currentTM to time_t
     
     // Call the other isTimeInRange function with the time_t version of current time
-    return this->isTimeInRange(startExpr, endExpr, currentTime);
+    return this->isTimeInRange(startExpr, endExpr, currentTime, startYear, endYear);
 }
 
-bool TimeRangeMgr::isTimeInRange(const cronexpr& startExpr, const cronexpr& endExpr, const std::time_t& currentTime) {
+bool TimeRangeMgr::isTimeInRange(const cronexpr& startExpr, const cronexpr& endExpr, const time_t& currentTime, const string& startYear = "", const string& endYear = "") {
     
+    // Check if the current year is within the start and end year range
+    bool startYearExists = (startYear != "");
+    bool endYearExists = (endYear != "");
+
+    if (startYearExists || endYearExists)
+    {
+        // Get the current year
+        tm currentTM = *localtime(&currentTime);
+        int currentYear = currentTM.tm_year + 1900; // tm_year is years since 1900
+
+        // Check if the current year is within the start and end year range
+        if (startYearExists && currentYear < stoi(startYear))
+        {
+            return false;
+        }
+        if (endYearExists && currentYear > stoi(endYear))
+        {
+            return false;
+        }
+    }
+
     // Find the next occurrence of the start time after the current time
-    std::time_t nextStartTime = cron_next(startExpr, currentTime);
+    time_t nextStartTime = cron_next(startExpr, currentTime);
 
     // Find the next occurrence of the end time after the current time
-    std::time_t nextEndTime = cron_next(endExpr, currentTime);
+    time_t nextEndTime = cron_next(endExpr, currentTime);
 
     // Check if we are currently in the time range
     return (nextStartTime > nextEndTime);
 }
 
-task_process_status TimeRangeMgr::writeCrontabFile(const string &fileName, const string &schedule, const string &command, bool deleteSelfAfterCompletion)
+task_process_status TimeRangeMgr::writeCrontabFile(const string &fileName, const string &schedule, const string &command)
 {
     string cronFileName = CRON_FILES_PATH_PREFIX_STR + fileName;
     ofstream crontabFile{cronFileName};
@@ -51,10 +72,6 @@ task_process_status TimeRangeMgr::writeCrontabFile(const string &fileName, const
     crontabFile << schedule << " ";
     crontabFile << CRON_USERNAME_STR << " ";
     crontabFile << command;
-    if (deleteSelfAfterCompletion)
-    {
-        crontabFile << " ; rm " << cronFileName;
-    }
     crontabFile << endl;
     crontabFile.close();
 
@@ -63,31 +80,42 @@ task_process_status TimeRangeMgr::writeCrontabFile(const string &fileName, const
 }
 
 // TODO add rollback mechanism
-task_process_status TimeRangeMgr::createCronjobs(const string &taskName, const string &startTime, const string &endTime, bool runOnce)
+task_process_status TimeRangeMgr::createCronjobs(const string &taskName, const string &startTime, const string &endTime, const string &startYear = "", const string &endYear = "")
 {
     string enableCrontabName = taskName + "-enable";
     string disableCrontabName = taskName + "-disable";
 
+    // Create year check string
+    string yearCheck = "";
+    if (startYear != "")
+    {
+        yearCheck = "[ $(date +\"%Y\") -ge " + startYear + " ]";
+    }
+    if (endYear != "")
+    {
+        if (startYear != "")
+        {
+            yearCheck += " && ";
+        }
+        yearCheck += "[ $(date +\"%Y\") -le " + endYear + " ]";
+    }
+
     // Create command for enabling the task
     string command_enabled = string("/usr/bin/redis-cli -n ") + to_string(STATE_DB) + " HSET '" + STATE_TIME_RANGE_STATUS_TABLE_NAME + "|" + taskName + "' '" + TIME_RANGE_STATUS_STR + "' '" + TIME_RANGE_ACTIVE_STR + "'";
+    command_enabled = yearCheck + " && " + command_enabled;
 
     // Create command for disabling the task
     string command_disabled = string("/usr/bin/redis-cli -n ") + to_string(STATE_DB) + " HSET '" + STATE_TIME_RANGE_STATUS_TABLE_NAME + "|" + taskName + "' '" + TIME_RANGE_STATUS_STR + "' '" + TIME_RANGE_INACTIVE_STR + "'";
-    if (runOnce)
-    {
-        // Delete the time range configuration entry after the task has been disabled
-        // writeCrontabFile() will delete the crontab file itself after the task has been executed
-        command_disabled += " ; /usr/bin/redis-cli -n " + to_string(CONFIG_DB) + " del '" + CFG_TIME_RANGE_TABLE_NAME + "|" + taskName + "'";
-    }
+    command_disabled = yearCheck + " && " + command_disabled;
 
     // Service file for enabling the task
-    if (writeCrontabFile(enableCrontabName, startTime, command_enabled, runOnce) != task_process_status::task_success)
+    if (writeCrontabFile(enableCrontabName, startTime, command_enabled) != task_process_status::task_success)
     {
         return task_process_status::task_need_retry;
     }
 
     // Service file for disabling the task
-    if (writeCrontabFile(disableCrontabName, endTime, command_disabled, runOnce) != task_process_status::task_success)
+    if (writeCrontabFile(disableCrontabName, endTime, command_disabled) != task_process_status::task_success)
     {
         return task_process_status::task_need_retry;
     }
@@ -126,9 +154,8 @@ task_process_status TimeRangeMgr::doTimeRangeTask(const string &rangeName, const
     SWSS_LOG_ENTER();
     string start = "";
     string end = "";
-    string runOnce = "";
-
-    cron::detail::replace_ordinals("", vector<string>{});
+    string start_year = "";
+    string end_year = "";
 
     for (const auto &i : fieldValues)
     {
@@ -140,9 +167,13 @@ task_process_status TimeRangeMgr::doTimeRangeTask(const string &rangeName, const
         {
             end = fvValue(i);
         }
-        else if (fvField(i) == "runOnce")
+        else if (fvField(i) == "start_year")
         {
-            runOnce = fvValue(i);
+            start_year = fvValue(i);
+        }
+        else if (fvField(i) == "end_year")
+        {
+            end_year = fvValue(i);
         }
         else
         {
@@ -159,7 +190,7 @@ task_process_status TimeRangeMgr::doTimeRangeTask(const string &rangeName, const
 
     // Create cron files for time range and enable them
     // TODO sanitize inputs
-    if (task_process_status::task_need_retry == createCronjobs(rangeName, start, end, (runOnce == "true")))
+    if (task_process_status::task_need_retry == createCronjobs(rangeName, start, end, start_year, end_year))
     {
         return task_process_status::task_need_retry;
     }
@@ -171,14 +202,14 @@ task_process_status TimeRangeMgr::doTimeRangeTask(const string &rangeName, const
         // croncpp.h uses nonstandard "seconds" field. Add "0 " to the beginning of the cron expression.
         // This is a workaround to avoid using seconds field.
         // TODO To make croncpp more efficient for standard cron use, remove seconds field from croncpp.h
-        auto startSeconds = string("0 ") + start;
-        auto endSeconds = string("0 ") + end;
-        auto startExpr = make_cron(startSeconds);
-        auto endExpr = make_cron(endSeconds);
+        // auto startSeconds = string("0 ") + start;
+        // auto endSeconds = string("0 ") + end;
+        auto startExpr = make_cron(start);
+        auto endExpr = make_cron(end);
 
         time_t currentTime = time(nullptr);
 
-        if (isTimeInRange(startExpr, endExpr, currentTime))
+        if (isTimeInRange(startExpr, endExpr, currentTime, start_year, end_year))
         {
             SWSS_LOG_INFO("Time range %s is active", rangeName.c_str());
             time_range_default_status = TIME_RANGE_ACTIVE_STR;
