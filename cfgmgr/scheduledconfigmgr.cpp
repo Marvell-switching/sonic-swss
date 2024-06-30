@@ -50,6 +50,7 @@ DBConnector* ScheduledConfigMgr::getDBConnector(const string &tableName){
 
 string join(const json &jsonArray, const string &delimiter)
 {
+    // Join the elements of the JSON array into a single string
     string result;
 
     for (auto it = jsonArray.begin(); it != jsonArray.end(); ++it)
@@ -131,6 +132,7 @@ bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, c
 
     // Create a Table object for the given tableName
     ProducerStateTable tableObj(m_appDb, tableName);
+    
     
     // Extract the key and fieldValues from the JSON object
     for (auto it = tableKeyFields.begin(); it != tableKeyFields.end(); ++it) {
