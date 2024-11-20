@@ -228,6 +228,7 @@ public:
     void decreaseNextHopGroupCount();
     bool checkNextHopGroupCount();
     const RouteTables& getSyncdRoutes() const { return m_syncdRoutes; }
+    bool reconfigureRoute(sai_object_id_t vrf_id, IpPrefix& ip_prefix, const NextHopGroupKey& nhg);
 
 private:
     SwitchOrch *m_switchOrch;

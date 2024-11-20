@@ -2827,3 +2827,42 @@ inline void RouteOrch::removeVipRouteSubnetDecapTerm(const IpPrefix &ipPrefix)
     m_appTunnelDecapTermProducer.del(key);
     m_SubnetDecapTermsCreated.erase(it);
 }
+
+
+bool RouteOrch::reconfigureRoute(sai_object_id_t vrf_id, IpPrefix& ip_prefix, const NextHopGroupKey& nhg)
+{
+    SWSS_LOG_NOTICE("Reconfiguring nexthops %s for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
+    auto it_route = m_syncdRoutes.at(vrf_id).find(ip_prefix);
+    if (it_route != m_syncdRoutes.at(vrf_id).end())
+    {
+        if (!removeNextHopGroup(nhg))
+        {
+            SWSS_LOG_ERROR("Failed to remove nexthopgroup %s  for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
+            return false;
+        }
+
+        sai_attribute_t nhg_attr;
+        vector<sai_attribute_t> nhg_attrs;
+
+        nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+        nhg_attr.value.s32 = m_switchOrch->checkOrderedEcmpEnable() ? SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_ORDERED_ECMP : SAI_NEXT_HOP_GROUP_TYPE_ECMP;
+        nhg_attrs.push_back(nhg_attr);
+
+        sai_object_id_t ars_object_id;
+        if (m_gArsOrch && m_gArsOrch->isRouteArs(vrf_id, ip_prefix, &ars_object_id))
+        {
+            nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID;
+            nhg_attr.value.oid = ars_object_id;
+            nhg_attrs.push_back(nhg_attr);
+        }
+
+        if (!addNextHopGroup(nhg, nhg_attrs))
+        {
+            SWSS_LOG_ERROR("Failed to add nexthopgroup %s for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
+            return false;
+        }
+    }
+    SWSS_LOG_NOTICE("Reconfigured nexthopgroup %s for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
+
+    return true;
+}

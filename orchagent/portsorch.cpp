@@ -9735,7 +9735,7 @@ bool PortsOrch::setPortArsLoadScaling(const Port& port)
     sai_attribute_t attr;
 
     attr.id = SAI_PORT_ATTR_ARS_PORT_LOAD_SCALING_FACTOR;
-    attr.value.u32 = port.m_speed / 1000;
+    attr.value.u32 = port.m_speed / 10000;
     sai_status_t status = sai_port_api->set_port_attribute(port.m_port_id, &attr);
 
     if (status != SAI_STATUS_SUCCESS)

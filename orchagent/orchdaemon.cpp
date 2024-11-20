@@ -211,10 +211,33 @@ bool OrchDaemon::init()
     gFgNhgOrch = new FgNhgOrch(m_configDb, m_applDb, m_stateDb, fgnhg_tables, gNeighOrch, gIntfsOrch, vrf_orch);
     gDirectory.set(gFgNhgOrch);
 
-    SWSS_LOG_WARN("Considering ARS support");
+    SWSS_LOG_WARN("Considering ARS support on gSwitchId = %lx", gSwitchId);
     sai_attr_capability_t capability;
+
+ if (sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_ARS_PROFILE,
+                                       SAI_ARS_PROFILE_ATTR_ALGO/* SAI_ARS_PROFILE_ATTR_PORT_LOAD_PAST*/,
+                                       &capability) == SAI_STATUS_SUCCESS)
+ {
+     SWSS_LOG_WARN("SAI_ARS_PROFILE_ATTR_ALGO is supported");
+ }
+ else 
+ {
+     SWSS_LOG_WARN("SAI_ARS_PROFILE_ATTR_ALGO is NOT supported");
+ }
+
+ if (sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_ARS_PROFILE,
+                                       SAI_ARS_PROFILE_ATTR_PORT_LOAD_PAST,
+                                       &capability) == SAI_STATUS_SUCCESS)
+ {
+     SWSS_LOG_WARN("SAI_ARS_PROFILE_ATTR_PORT_LOAD_PAST is supported");
+ }
+ else
+ {
+     SWSS_LOG_WARN("SAI_ARS_PROFILE_ATTR_PORT_LOAD_PAST is NOT supported");
+ }
+
     if (sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_ARS_PROFILE,
-                                       SAI_ARS_PROFILE_ALGO_EWMA,
+                                       SAI_ARS_PROFILE_ATTR_ALGO,
                                        &capability) == SAI_STATUS_SUCCESS)
     {
         const int arsorch_pri = 15;
@@ -231,6 +254,12 @@ bool OrchDaemon::init()
         gIsArsSupported = true;
         SWSS_LOG_WARN("ARS support is enabled");
     }
+//    else
+//   {
+//        gArsOrch = nullptr;
+//    }
+
+
 
     vector<string> srv6_tables = {
         APP_SRV6_SID_LIST_TABLE_NAME,

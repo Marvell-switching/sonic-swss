@@ -61,10 +61,13 @@ public:
 
 private:
     sai_object_id_t m_sai_ars_id;
-    sai_object_id_t m_sai_ars_profile_id;
+    sai_object_id_t m_sai_ars_profile_id = SAI_NULL_OBJECT_ID;
     ArsProfiles m_arsProfiles;
     ArsNexthopGroupPrefixes m_arsNexthopGroupPrefixes;
     bool isArsConfigured;
+    ProducerStateTable m_arsProfileStateTable;
+    ProducerStateTable m_arsIfStateTable;
+    ProducerStateTable m_arsPrefixStateTable;
 
     bool updateArsMinPathInterface(ArsProfileEntry &profile, const Port &port, const bool is_enable);
     bool doTaskArsProfile(const KeyOpFieldsValuesTuple&);
