@@ -29,6 +29,7 @@
 #include "nhgorch.h"
 #include "copporch.h"
 #include "twamporch.h"
+#include "arsorch.h"
 #include "directory.h"
 
 extern int gBatchSize;

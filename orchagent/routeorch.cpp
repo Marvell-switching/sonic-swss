@@ -35,7 +35,7 @@ extern string gMySwitchType;
 #define DEFAULT_NUMBER_OF_ECMP_GROUPS   128
 #define DEFAULT_MAX_ECMP_GROUP_SIZE     32
 
-RouteOrch::RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch, FgNhgOrch *fgNhgOrch, Srv6Orch *srv6Orch) :
+RouteOrch::RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch, FgNhgOrch *fgNhgOrch, Srv6Orch *srv6Orch, ArsOrch *gArsOrch) :
         gRouteBulker(sai_route_api, gMaxBulkSize),
         gLabelRouteBulker(sai_mpls_api, gMaxBulkSize),
         gNextHopGroupMemberBulker(sai_next_hop_group_api, gSwitchId, gMaxBulkSize),
@@ -48,7 +48,8 @@ RouteOrch::RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames,
         m_nextHopGroupCount(0),
         m_srv6Orch(srv6Orch),
         m_resync(false),
-        m_appTunnelDecapTermProducer(db, APP_TUNNEL_DECAP_TERM_TABLE_NAME)
+        m_appTunnelDecapTermProducer(db, APP_TUNNEL_DECAP_TERM_TABLE_NAME),
+        m_gArsOrch(gArsOrch)
 {
     SWSS_LOG_ENTER();
 
@@ -1274,7 +1275,7 @@ bool RouteOrch::removeFineGrainedNextHopGroup(sai_object_id_t &next_hop_group_id
     return true;
 }
 
-bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
+bool RouteOrch::addNextHopGroup(const NextHopGroupKey& nexthops, vector<sai_attribute_t> &nhg_attrs)
 {
     SWSS_LOG_ENTER();
 
@@ -1331,13 +1332,6 @@ bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
             nhopgroup_shared_set[next_hop_id].insert(it);
         }
     }
-
-    sai_attribute_t nhg_attr;
-    vector<sai_attribute_t> nhg_attrs;
-
-    nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
-    nhg_attr.value.s32 = m_switchOrch->checkOrderedEcmpEnable() ? SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_ORDERED_ECMP : SAI_NEXT_HOP_GROUP_TYPE_ECMP;
-    nhg_attrs.push_back(nhg_attr);
 
     sai_object_id_t next_hop_group_id;
     sai_status_t status = sai_next_hop_group_api->create_next_hop_group(&next_hop_group_id,
@@ -1448,6 +1442,18 @@ bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
     m_syncdNextHopGroups[nexthops] = next_hop_group_entry;
 
     return true;
+}
+
+bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nextHops)
+{
+    sai_attribute_t nhg_attr;
+    vector<sai_attribute_t> nhg_attrs;
+
+    nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+    nhg_attr.value.s32 = m_switchOrch->checkOrderedEcmpEnable() ? SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_ORDERED_ECMP : SAI_NEXT_HOP_GROUP_TYPE_ECMP;
+    nhg_attrs.push_back(nhg_attr);
+
+    return addNextHopGroup(nextHops, nhg_attrs);
 }
 
 bool RouteOrch::removeNextHopGroup(const NextHopGroupKey &nexthops)
@@ -1896,8 +1902,25 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
                     return false;
                 }
             }
+
+
+            sai_attribute_t nhg_attr;
+            vector<sai_attribute_t> nhg_attrs;
+
+            nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+            nhg_attr.value.s32 = m_switchOrch->checkOrderedEcmpEnable() ? SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_ORDERED_ECMP : SAI_NEXT_HOP_GROUP_TYPE_ECMP;
+            nhg_attrs.push_back(nhg_attr);
+
+            sai_object_id_t ars_object_id;
+            if (m_gArsOrch && m_gArsOrch->isRouteArs(vrf_id, ipPrefix, &ars_object_id))
+            {
+                nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID;
+                nhg_attr.value.oid = ars_object_id;
+                nhg_attrs.push_back(nhg_attr);
+            }
+
             /* Try to create a new next hop group */
-            if (!addNextHopGroup(nextHops))
+            if (!addNextHopGroup(nextHops, nhg_attrs))
             {
                 for(auto it = nextHops.getNextHops().begin(); it != nextHops.getNextHops().end(); ++it)
                 {
@@ -2835,4 +2858,43 @@ inline void RouteOrch::removeVipRouteSubnetDecapTerm(const IpPrefix &ipPrefix)
     string key = tunnel_name + ":" + ipPrefix.to_string();
     m_appTunnelDecapTermProducer.del(key);
     m_SubnetDecapTermsCreated.erase(it);
+}
+
+
+bool RouteOrch::reconfigureRoute(sai_object_id_t vrf_id, IpPrefix& ip_prefix, const NextHopGroupKey& nhg)
+{
+    SWSS_LOG_NOTICE("Reconfiguring nexthops %s for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
+    auto it_route = m_syncdRoutes.at(vrf_id).find(ip_prefix);
+    if (it_route != m_syncdRoutes.at(vrf_id).end())
+    {
+        if (!removeNextHopGroup(nhg))
+        {
+            SWSS_LOG_ERROR("Failed to remove nexthopgroup %s  for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
+            return false;
+        }
+
+        sai_attribute_t nhg_attr;
+        vector<sai_attribute_t> nhg_attrs;
+
+        nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+        nhg_attr.value.s32 = m_switchOrch->checkOrderedEcmpEnable() ? SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_ORDERED_ECMP : SAI_NEXT_HOP_GROUP_TYPE_ECMP;
+        nhg_attrs.push_back(nhg_attr);
+
+        sai_object_id_t ars_object_id;
+        if (m_gArsOrch && m_gArsOrch->isRouteArs(vrf_id, ip_prefix, &ars_object_id))
+        {
+            nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID;
+            nhg_attr.value.oid = ars_object_id;
+            nhg_attrs.push_back(nhg_attr);
+        }
+
+        if (!addNextHopGroup(nhg, nhg_attrs))
+        {
+            SWSS_LOG_ERROR("Failed to add nexthopgroup %s for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
+            return false;
+        }
+    }
+    SWSS_LOG_NOTICE("Reconfigured nexthopgroup %s for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
+
+    return true;
 }
