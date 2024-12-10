@@ -546,6 +546,7 @@ namespace flexcounter_test
         flexCounterCfg.set("PORT", values);
         flexCounterCfg.set("BUFFER_POOL_WATERMARK", values);
         flexCounterCfg.set("PFCWD", values);
+        flexCounterCfg.set("POLICER", values);
 
         auto flexCounterOrch = gDirectory.get<FlexCounterOrch*>();
         flexCounterOrch->addExistingData(&flexCounterCfg);
@@ -597,6 +598,13 @@ namespace flexcounter_test
                                               {STATS_MODE_FIELD, STATS_MODE_READ},
                                               {FLEX_COUNTER_STATUS_FIELD, "enable"},
                                           }));
+        ASSERT_TRUE(checkFlexCounterGroup(POLICER_STAT_COUNTER_FLEX_COUNTER_GROUP,
+                                          {
+                                              {POLL_INTERVAL_FIELD, "1000"},
+                                              {STATS_MODE_FIELD, STATS_MODE_READ},
+                                              {FLEX_COUNTER_STATUS_FIELD, "enable"},
+                                              {POLICER_PLUGIN_FIELD, ""}
+                                          }));   
 
         sai_object_id_t pool_oid;
         pool_oid = (*BufferOrch::m_buffer_type_maps[APP_BUFFER_POOL_TABLE_NAME])["ingress_lossless_pool"].m_saiObjectId;
