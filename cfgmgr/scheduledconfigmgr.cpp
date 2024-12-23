@@ -133,13 +133,14 @@ bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, c
     // Create a Table object for the given tableName
     ProducerStateTable tableObj(m_appDb, tableName);
     
-    
     // Extract the key and fieldValues from the JSON object
     for (auto it = tableKeyFields.begin(); it != tableKeyFields.end(); ++it) {
 
         // Extract the key and value from the iterator
         const string& key = it.key();
         const json& fieldValuesJson = it.value();
+
+        SWSS_LOG_DEBUG("Extracted key %s from table %s", key.c_str(), tableName.c_str());
         
         // Here, we convert the JSON tableDetails into the vector<FieldValueTuple> format.
         vector<FieldValueTuple> fieldValues = convertJsonToFieldValues(fieldValuesJson);
@@ -149,6 +150,7 @@ bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, c
             return false;
         }
 
+        SWSS_LOG_DEBUG("Setting key %s in table %s", key.c_str(), tableName.c_str());
         // Create a Table object and set the field values
         tableObj.set(key, fieldValues);
     }
@@ -170,12 +172,12 @@ bool ScheduledConfigMgr::removeTableConfiguration(const string &tableName, const
 task_process_status ScheduledConfigMgr::applyConfiguration(const string &configName, const json &configJson)
 {
     SWSS_LOG_ENTER();
-
     for (const auto &tableEntry : configJson.items())
     {
-        string tableName = tableEntry.key();          // Table name
+        string tableName = tableEntry.key();             // Table name
         const json &tableKeyFields = tableEntry.value(); // Table details
 
+        SWSS_LOG_DEBUG("Found table name %s inside configuration %s", tableName.c_str(), configName.c_str());
         if (!applyTableConfiguration(tableName, tableKeyFields))
         {
             SWSS_LOG_ERROR("Failed to apply configuration %s for table: %s", configName.c_str(), tableName.c_str());
@@ -307,7 +309,6 @@ task_process_status ScheduledConfigMgr::doProcessScheduledConfiguration(string t
 task_process_status ScheduledConfigMgr::doProcessTimeRangeStatus(string timeRangeName, string status)
 {
     SWSS_LOG_ENTER();
-    SWSS_LOG_INFO("Processing time range status for time range %s", timeRangeName.c_str());
     task_process_status task_status = task_process_status::task_success;
 
     // Validate timeRangeName and status
@@ -326,7 +327,7 @@ task_process_status ScheduledConfigMgr::doProcessTimeRangeStatus(string timeRang
             // Create the time range in the local db with default value
             scheduledConfigurations[timeRangeName];
 
-            SWSS_LOG_INFO("Adding unbound configurations for time range %s", timeRangeName.c_str());
+            SWSS_LOG_INFO("Adding unbound configurations for time range %s if exist", timeRangeName.c_str());
             if (unboundConfigurations.find(timeRangeName) != unboundConfigurations.end())
             {
                 for (const auto &configData : unboundConfigurations[timeRangeName])
@@ -336,12 +337,13 @@ task_process_status ScheduledConfigMgr::doProcessTimeRangeStatus(string timeRang
                 }
                 unboundConfigurations.erase(timeRangeName);
             }
-
+            SWSS_LOG_INFO("Finished adding unbound configurations for time range %s if exist", timeRangeName.c_str());
             SWSS_LOG_INFO("Time range %s created in local db, will retry to decide what to do next", timeRangeName.c_str());
             return task_process_status::task_need_retry;
         }
 
         // If the time range exists, apply the configuration based on the status
+        SWSS_LOG_INFO("Time range %s is %s", timeRangeName.c_str(), status.c_str());
         if (status == "active"){
             task_status = enableTimeRange(timeRangeName);
         }
@@ -382,6 +384,7 @@ task_process_status ScheduledConfigMgr::enableTimeRange(const string &timeRangeN
         SWSS_LOG_INFO("No configuration found for time range %s", timeRangeName.c_str());
         return task_process_status::task_success;
     }
+    SWSS_LOG_DEBUG("Found configuration for time range %s", timeRangeName.c_str());
 
     // Apply the configuration
     // scheduledConfigurations[timeRangeName].first is the configName
@@ -392,6 +395,7 @@ task_process_status ScheduledConfigMgr::enableTimeRange(const string &timeRangeN
     {
         configName = configData.first;
         configJson = configData.second;
+        SWSS_LOG_INFO("Applying configuration %s for time range %s", configName.c_str(), timeRangeName.c_str());
         if (task_process_status::task_success != applyConfiguration(configName, configJson))
         {
             SWSS_LOG_ERROR("Could not apply configuration for time range %s, configName: %s", timeRangeName.c_str(), configName.c_str());
@@ -451,8 +455,9 @@ void ScheduledConfigMgr::doTimeRangeTask(Consumer &consumer)
         string keySeparator = CONFIGDB_KEY_SEPARATOR;
         vector<string> keys = tokenize(kfvKey(t), keySeparator[0]);
         timeRangeName = keys[0];
-
         string op = kfvOp(t);
+
+        SWSS_LOG_INFO("OP: %s, TABLE_ID: %s", op.c_str(), timeRangeName.c_str());
         task_process_status task_status = task_process_status::task_success;
         if (op == SET_COMMAND)
         {
@@ -472,6 +477,7 @@ void ScheduledConfigMgr::doTimeRangeTask(Consumer &consumer)
 
             if (task_status == task_process_status::task_success)
             {
+                SWSS_LOG_INFO("Processing time range %s with status %s", timeRangeName.c_str(), status.c_str());
                 task_status = doProcessTimeRangeStatus(timeRangeName, status);
             }
         } else if (op == DEL_COMMAND)

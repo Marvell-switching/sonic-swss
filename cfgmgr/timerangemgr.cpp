@@ -99,14 +99,16 @@ task_process_status TimeRangeMgr::createCronjobs(const string &taskName, const s
         }
         yearCheck += "[ $(date +\"%Y\") -le " + endYear + " ]";
     }
+    if (yearCheck != "")
+        yearCheck += " && ";
 
     // Create command for enabling the task
     string command_enabled = string("/usr/bin/redis-cli -n ") + to_string(STATE_DB) + " HSET '" + STATE_TIME_RANGE_STATUS_TABLE_NAME + "|" + taskName + "' '" + TIME_RANGE_STATUS_STR + "' '" + TIME_RANGE_ACTIVE_STR + "'";
-    command_enabled = yearCheck + " && " + command_enabled;
+    command_enabled = yearCheck + command_enabled;
 
     // Create command for disabling the task
     string command_disabled = string("/usr/bin/redis-cli -n ") + to_string(STATE_DB) + " HSET '" + STATE_TIME_RANGE_STATUS_TABLE_NAME + "|" + taskName + "' '" + TIME_RANGE_STATUS_STR + "' '" + TIME_RANGE_INACTIVE_STR + "'";
-    command_disabled = yearCheck + " && " + command_disabled;
+    command_disabled = yearCheck + command_disabled;
 
     // Service file for enabling the task
     if (writeCrontabFile(enableCrontabName, startTime, command_enabled) != task_process_status::task_success)
