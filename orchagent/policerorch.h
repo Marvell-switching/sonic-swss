@@ -11,7 +11,7 @@ using namespace std;
 typedef map<string, sai_object_id_t> PolicerTable;
 typedef map<string, int> PolicerRefCountTable;
 
-class PolicerOrch : public Orch
+class PolicerOrch : public Orch, public Observer, public Subject
 {
 public:
     PolicerOrch(vector<TableConnector> &tableNames, PortsOrch *portOrch);
