@@ -14,9 +14,6 @@
 
 #include <map>
 
-/* Name of the ARS profile */
-typedef std::string ArsProfile;
-
 enum ArsMatchMode
 {
     MATCH_ROUTE_BASED,
@@ -28,22 +25,80 @@ enum ArsAssignMode
     PER_PACKET
 };
 
-typedef struct ArsProfileEntry
+typedef struct ArsObjectEntry
 {
-    string profile_name;                            // Name of ARS profile configured by user
-    std::vector<IpPrefix> prefixes;                 // Prefix which desires FG behavior
-    ArsMatchMode match_mode;                        // Stores a match_mode from ArsMatchModes
+    string name;                                    // Name of ARS object configured by user
     ArsAssignMode assign_mode;                      // Stores an assign_mode from ArsAssignModes
     uint32_t flowlet_idle_time;                     // Flowlet idle time in micro seconds
     uint32_t max_flows;                             // Maximum number of flows in a flowlet
-    std::set<string> minPathInterfaces;             // Min path interfaces for the profile
+    struct
+    {
+        uint32_t primary_threshold;                 // Primary path threshold
+        uint32_t alt_threshold;                     // Alternate path threshold
+    } quality_threshold;
+    std::set<string> altPathInterfaces;             // ARS-Enabled interfaces which compose alternative/non-minimal path
+    std:set<string> prefixes;                       // Prefixes pointing to ARS-enabled NHG
+    std::set<IpAddress> altPathNexthops;            // ARS-Enabled nexthops which compose alternative/non-minimal path
+    std::set(string) lags;                          // ARS-enabled LAGs
+    std::set<string> altPathPorts;                  // Ports of ARS-Enabled LAGs which compose alternative/non-minimal path
     sai_object_id_t ars_object_id;                  // ARS Object ID if already created
+} ArsObjectEntry;
+
+typedef struct
+{
+    uint32_t min_value;
+    uint32_t max_value;
+} ArsQuantizationBandValues;
+
+typedef enum
+{
+    ARS_ALGORITHM_EWMA
+} ArsAlgorithm;
+
+typedef struct ArsProfileEntry
+{
+    string profile_name;                                    // Name of ARS profile configured by user
+    ArsAlgorithm algorithm;                                 // ARS algorithm
+    uint32_t max_flows;                                     // Maximum number of supported flows
+    uint32_t sampling_interval;                             // Sampling interval in micro seconds
+    struct
+    {
+        struct {
+            uint32_t min_value;                             // Minimum value of the load
+            uint32_t max_value;                             // Maximum value of the load
+            uint32_t weight;                                // Weight of the metric
+        } past_load;
+
+        struct {
+            uint32_t min_value;                             // Minimum value of the load
+            uint32_t max_value;                             // Maximum value of the load
+        } current_load;
+
+        struct {
+            uint32_t min_value;                             // Minimum value of the load
+            uint32_t max_value;                             // Maximum value of the load
+            uint32_t weight;                                // Weight of the metric
+        } future_load;
+    } path_metrics;
+
+    map<uint32_t, ArsQuantizationBandValues> quantization_bands;   // Quantization bands
+
+    bool ipv4_enabled;                                      // Enable IPv4
+    bool ipv6_enabled;                                      // Enable IPv6
+    set<std::string> ars_objects;                           // ARS Objects for the profile
+    sai_object_id_t m_sai_ars_id;                           // SAI ARS profile OID
 } ArsProfileEntry;
 
-/* Map from IP prefix to user configured ARS entries */
-typedef std::map<IpPrefix, ArsProfileEntry*> ArsNexthopGroupPrefixes; 
+/* Map from IP prefix to ARS object */
+typedef std::map<IpPrefix, ArsObjectEntry*> ArsNexthopGroupPrefixes; 
+typedef std::map<std::string, ArsNexthopGroupPrefixes> ArsPrefixesTables;
+/* Map from LAG name to ARS object */
+typedef std::map<std::string, ArsObjectEntry*> ArsLags;
 /* Main structure to hold user configuration */
-typedef std::map<ArsProfile, ArsProfileEntry> ArsProfiles;
+typedef std::map<std::string, ArsProfileEntry> ArsProfiles;
+typedef std::map<std::string, ArsObjectEntry> ArsObjects;
+/* list of ARS-enabled Interfaces */
+typedef std::set<string> ArsEnabledInterfaces;             // ARS-Enabled interfaces for the profile
 
 
 class ArsOrch : public Orch, public Observer
@@ -51,29 +106,108 @@ class ArsOrch : public Orch, public Observer
 public:
     ArsOrch(DBConnector *db, DBConnector *appDb, DBConnector *stateDb, vector<table_name_with_pri_t> &tableNames);
 
-    bool setArsProfile(ArsProfileEntry &profile);
-    bool createArsProfile(ArsProfileEntry &profile);
-    bool isRouteArs(sai_object_id_t vrf_id, const IpPrefix &ipPrefix, sai_object_id_t * ars_object_id);
+    bool setArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t> &ars_attrs);
+    bool createArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t> &ars_attrs);
+    bool setArsObject(ArsObjectEntry &object, vector<sai_attribute_t> &ars_attrs);
+    bool createArsObject(ArsObjectEntry &object, vector<sai_attribute_t> &ars_attrs);
+    bool isRouteArs(sai_object_id_t vrf_id, const IpPrefix &ipPrefix, sai_object_id_t * ars_object_id, std::set<IpAddress> &altPathMembers);
+    bool isLagArs(const std::string if_name, sai_object_id_t * ars_object_id, std::set<string> &altPathMembers);
 
     // warm reboot support
     bool bake() override;
     void update(SubjectType type, void *cntx);
 
 private:
-    sai_object_id_t m_sai_ars_id;
-    sai_object_id_t m_sai_ars_profile_id = SAI_NULL_OBJECT_ID;
+    bool m_isArsSupported = false;
     ArsProfiles m_arsProfiles;
-    ArsNexthopGroupPrefixes m_arsNexthopGroupPrefixes;
-    bool isArsConfigured;
-    ProducerStateTable m_arsProfileStateTable;
-    ProducerStateTable m_arsIfStateTable;
-    ProducerStateTable m_arsPrefixStateTable;
+    ArsObjects m_arsObjects;
+    ArsPrefixesTables m_arsNexthopGroupPrefixes;
+    ArsEnabledInterfaces m_arsEnabledInterfaces;
+    ArsLags m_arsLags;
+    VRFOrch *m_vrfOrch;
 
-    bool updateArsMinPathInterface(ArsProfileEntry &profile, const Port &port, const bool is_enable);
+
+    bool updateArsInterface(ArsProfileEntry &profile, const Port &port, const bool is_enable);
+    bool doTaskArsObject(const KeyOpFieldsValuesTuple&);
     bool doTaskArsProfile(const KeyOpFieldsValuesTuple&);
-    bool doTaskArsMinPathInterfaces(const KeyOpFieldsValuesTuple&);
-    bool doTaskArsNhgPrefix(const KeyOpFieldsValuesTuple&);
+    bool doTaskArsInterfaces(const KeyOpFieldsValuesTuple&);
+    bool doTaskArsNexthopGroup(const KeyOpFieldsValuesTuple&);
+    bool doTaskArsLag(const KeyOpFieldsValuesTuple&);
     void doTask(Consumer& consumer);
+
+    isSetImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id)
+    {
+        auto feature = ars_features.find(object_type);
+        if (feature == ars_features.end())
+        {
+            return false;
+        }
+        auto attr = feature->second.find(attr_id);
+        if (attr == feature->second.end())
+        {
+            return false;
+        }
+        return attr->second.set_implemented;
+    }
+
+    isCreateImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id)
+    {
+        auto feature = ars_features.find(object_type);
+        if (feature == ars_features.end())
+        {
+            return false;
+        }
+        auto attr = feature->second.find(attr_id);
+        if (attr == feature->second.end())
+        {
+            return false;
+        }
+        return attr->second.create_implemented;
+    }
+
+    isGetImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id)
+    {
+        auto feature = ars_features.find(object_type);
+        if (feature == ars_features.end())
+        {
+            return false;
+        }
+        auto attr = feature->second.find(attr_id);
+        if (attr == feature->second.end())
+        {
+            return false;
+        }
+        return attr->second.get_implemented;
+    }
+
+    void initCapabilities()
+    {
+        SWSS_LOG_ENTER();
+
+        for (auto it = ars_features.begin(); it != ars_features.end(); it++)
+        {
+            for (auto it2 = it->second.begin()->second.begin(); it2 != it->second.begin()->second.end(); it2++)
+            {
+                if (sai_query_attribute_capability(gSwitchId, (sai_object_type_t)it->first,
+                                                    (sai_attr_id_t)it2->first,
+                                                    &capability) == SAI_STATUS_SUCCESS)
+                {
+                    SWSS_LOG_NOTICE("Feature %s Attr %s is supported. Create %s Set %s Get %s", it->second.begin()->first.c_str(), it2->second.attr_name.c_str(), capability.create_implemented ? "Y" : "N", capability.set_implemented ? "Y" : "N", capability.get_implemented ? "Y" : "N");
+                }
+                else
+                {
+                    SWSS_LOG_NOTICE("Feature %s Attr %s is NOT supported", it->second.begin()->first.c_str(), it2->second.c_str());
+                }
+
+                it2->second.create_implemented = capability.create_implemented;
+                it2->second.set_implemented = capability.set_implemented;
+                it2->second.get_implemented = capability.get_implemented;
+            }
+        }
+
+        m_isArsSupported = isCreateImplemented(SAI_OBJECT_TYPE_SWITCH, SAI_SWITCH_ATTR_ARS_PROFILE);
+    }
+
 };
 
 #endif /* SWSS_ARSORCH_H */

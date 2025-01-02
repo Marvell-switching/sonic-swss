@@ -291,6 +291,7 @@ private:
     void removeVipRouteSubnetDecapTerm(const IpPrefix &ipPrefix);
 
     bool addNextHopGroup(const NextHopGroupKey&, vector<sai_attribute_t> &nhg_attrs);
+    bool updateNexthopArsState(const NextHopGroupKey& nhg, const std::set<IpAddress>& altPathMembers);
 };
 
 #endif /* SWSS_ROUTEORCH_H */

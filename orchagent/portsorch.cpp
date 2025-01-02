@@ -9866,6 +9866,26 @@ bool PortsOrch::setPortArsLoadScaling(const Port& port)
     return true;
 }
 
+bool PortsOrch::setPortArsAltPath(const Port& port, bool is_enable)
+{
+    sai_attribute_t attr;
+
+    attr.id = SAI_PORT_ATTR_ARS_ALTERNATE_PATH;
+    attr.value.booldata = is_enable;
+    sai_status_t status = sai_port_api->set_port_attribute(port.m_port_id, &attr);
+
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        task_process_status handle_status = handleSaiSetStatus(SAI_API_PORT, status);
+        if (handle_status != task_success)
+        {
+            return parseHandleSaiStatusFailure(handle_status);
+        }
+    }
+
+    return true;
+}
+
 bool PortsOrch::createPtTam()
 {
     SWSS_LOG_ENTER();

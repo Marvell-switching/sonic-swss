@@ -67,7 +67,6 @@ MonitorOrch *gMonitorOrch;
 TunnelDecapOrch *gTunneldecapOrch;
 
 bool gIsNatSupported = false;
-bool gIsArsSupported = false;
 event_handle_t g_events_handle;
 
 #define DEFAULT_MAX_BULK_SIZE 1000
@@ -211,54 +210,24 @@ bool OrchDaemon::init()
     gFgNhgOrch = new FgNhgOrch(m_configDb, m_applDb, m_stateDb, fgnhg_tables, gNeighOrch, gIntfsOrch, vrf_orch);
     gDirectory.set(gFgNhgOrch);
 
-    SWSS_LOG_WARN("Considering ARS support on gSwitchId = %lx", gSwitchId);
-    sai_attr_capability_t capability;
+    const int arsorch_pri = 15;
 
- if (sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_ARS_PROFILE,
-                                       SAI_ARS_PROFILE_ATTR_ALGO/* SAI_ARS_PROFILE_ATTR_PORT_LOAD_PAST*/,
-                                       &capability) == SAI_STATUS_SUCCESS)
- {
-     SWSS_LOG_WARN("SAI_ARS_PROFILE_ATTR_ALGO is supported");
- }
- else 
- {
-     SWSS_LOG_WARN("SAI_ARS_PROFILE_ATTR_ALGO is NOT supported");
- }
+    vector<table_name_with_pri_t> ars_tables = {
+        { CFG_ARS_PROFILE,                       arsorch_pri },
+        { CFG_ARS_QUANTIZATION_BANDS,            arsorch_pri },
+        { CFG_ARS_OBJECT,                        arsorch_pri },
+        { CFG_ARS_INTERFACE,                     arsorch_pri },
+        { CFG_ARS_NEXTHOP_GROUP,                 arsorch_pri },
+        { CFG_ARS_PORTCHANNEL,                   arsorch_pri },
+        { APP_ARS_PROFILE_TABLE_NAME,            arsorch_pri },
+        { APP_ARS_QUANTIZATION_BANDS_TABLE_NAME, arsorch_pri },
+        { APP_ARS_OBJECT_TABLE_NAME,             arsorch_pri },
+        { APP_ARS_INTERFACE_TABLE_NAME,          arsorch_pri },
+        { APP_ARS_NEXTHOP_GROUP_TABLE_NAME,      arsorch_pri },
+        { APP_ARS_PORTCHANNEL_TABLE_NAME,        arsorch_pri }
+    };
 
- if (sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_ARS_PROFILE,
-                                       SAI_ARS_PROFILE_ATTR_PORT_LOAD_PAST,
-                                       &capability) == SAI_STATUS_SUCCESS)
- {
-     SWSS_LOG_WARN("SAI_ARS_PROFILE_ATTR_PORT_LOAD_PAST is supported");
- }
- else
- {
-     SWSS_LOG_WARN("SAI_ARS_PROFILE_ATTR_PORT_LOAD_PAST is NOT supported");
- }
-
-    if (sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_ARS_PROFILE,
-                                       SAI_ARS_PROFILE_ATTR_ALGO,
-                                       &capability) == SAI_STATUS_SUCCESS)
-    {
-        const int arsorch_pri = 15;
-
-        vector<table_name_with_pri_t> ars_tables = {
-            { CFG_ARS_PROFILE,            arsorch_pri },
-            { CFG_ARS_MIN_PATH_INTERFACE, arsorch_pri },
-            { CFG_ARS_NHG_PREFIX,         arsorch_pri },
-            { CFG_ARS_NHG_MEMBER,         arsorch_pri }
-        };
-
-        gArsOrch = new ArsOrch(m_configDb, m_applDb, m_stateDb, ars_tables);
-        gDirectory.set(gArsOrch);
-        gIsArsSupported = true;
-        SWSS_LOG_WARN("ARS support is enabled");
-    }
-//    else
-//   {
-//        gArsOrch = nullptr;
-//    }
-
+    gArsOrch = new ArsOrch(m_configDb, m_applDb, m_stateDb, ars_tables);
 
 
     vector<string> srv6_tables = {
@@ -569,10 +538,7 @@ bool OrchDaemon::init()
     m_orchList.push_back(gMlagOrch);
     m_orchList.push_back(gIsoGrpOrch);
     m_orchList.push_back(gFgNhgOrch);
-    if (gIsArsSupported)
-    {
-        m_orchList.push_back(gArsOrch);
-    }
+    m_orchList.push_back(gArsOrch);
     m_orchList.push_back(mux_st_orch);
     m_orchList.push_back(nvgre_tunnel_orch);
     m_orchList.push_back(nvgre_tunnel_map_orch);

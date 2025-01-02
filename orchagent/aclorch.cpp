@@ -125,6 +125,11 @@ static acl_rule_attr_lookup_t aclOtherActionLookup =
     { ACTION_COUNTER,                       SAI_ACL_ENTRY_ATTR_ACTION_COUNTER}
 };
 
+static acl_rule_attr_lookup_t aclArsActionLookup =
+{
+    { ACTION_DISABLE_ARS_FORWARDING,        SAI_ACL_ENTRY_ATTR_ACTION_DISABLE_ARS_FORWARDING}
+};
+
 static acl_packet_action_lookup_t aclPacketActionLookup =
 {
     { PACKET_ACTION_FORWARD, SAI_PACKET_ACTION_FORWARD },
@@ -771,6 +776,8 @@ bool AclTableTypeParser::parseAclTableTypeActions(const std::string& value, AclT
         auto dtelAction = aclDTelActionLookup.find(action);
         auto otherAction = aclOtherActionLookup.find(action);
         auto metadataAction = aclMetadataDscpActionLookup.find(action);
+        auto arsAction = aclArsActionLookup.find(action);
+
         if (l3Action != aclL3ActionLookup.end())
         {
             saiActionAttr = l3Action->second;
@@ -790,6 +797,10 @@ bool AclTableTypeParser::parseAclTableTypeActions(const std::string& value, AclT
         else if (metadataAction != aclMetadataDscpActionLookup.end())
         {
             saiActionAttr = metadataAction->second;
+        }
+        else if (arsAction != aclArsActionLookup.end())
+        {
+            saiActionAttr = arsAction->second;
         }
         else
         {
@@ -3383,6 +3394,7 @@ void AclOrch::init(vector<TableConnector>& connectors, PortsOrch *portOrch, Mirr
         m_switchMetaDataCapabilities[TABLE_ACL_ENTRY_ATTR_META_CAPABLE] = "true";
         m_switchMetaDataCapabilities[TABLE_ACL_ENTRY_ACTION_META_CAPABLE] = "true";
         m_metaDataMgr.populateRange(1,7);
+        m_switchArsCapabilities[ACL_ENTRY_ACTION_DISABLE_ARS_CAPABLE] = "true";
     }
     else
     {
@@ -3400,6 +3412,7 @@ void AclOrch::init(vector<TableConnector>& connectors, PortsOrch *portOrch, Mirr
         m_switchMetaDataCapabilities[TABLE_ACL_USER_META_DATA_RANGE_CAPABLE] = "false";
         m_switchMetaDataCapabilities[TABLE_ACL_ENTRY_ATTR_META_CAPABLE] = "false";
         m_switchMetaDataCapabilities[TABLE_ACL_ENTRY_ACTION_META_CAPABLE] = "false";
+        m_switchArsCapabilities[ACL_ENTRY_ACTION_DISABLE_ARS_CAPABLE] = "false";
 
         status = sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_SWITCH, SAI_SWITCH_ATTR_ACL_USER_META_DATA_RANGE, &capability);
         if (status != SAI_STATUS_SUCCESS)
@@ -3475,7 +3488,23 @@ void AclOrch::init(vector<TableConnector>& connectors, PortsOrch *portOrch, Mirr
 
         m_metaDataMgr.populateRange(metadataMin, metadataMax);
 
+        status = sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_ACL_ENTRY, SAI_ACL_ENTRY_ATTR_ACTION_DISABLE_ARS_FORWARDING, &capability);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_WARN("Could not query SAI_ACL_ENTRY_ATTR_ACTION_DISABLE_ARS_FORWARDING %d", status);
+        }
+        else
+        {
+            if (capability.set_implemented)
+            {
+                m_switchArsCapabilities[ACL_ENTRY_ACTION_DISABLE_ARS_CAPABLE] = "true";
+            }
+
+            SWSS_LOG_NOTICE("SAI_ACL_ENTRY_ATTR_ACTION_DISABLE_ARS_FORWARDING capability %d", capability.set_implemented);
+        }
     }
+
+
     // Store the capabilities in state database
     // TODO: Move this part of the code into syncd
     vector<FieldValueTuple> fvVector;
@@ -3879,12 +3908,16 @@ void AclOrch::putAclActionCapabilityInDB(acl_stage_type_t stage)
     string delimiter;
     ostringstream acl_action_value_stream;
     ostringstream is_action_list_mandatory_stream;
-    acl_rule_attr_lookup_t metadataActionLookup = {};
+    acl_rule_attr_lookup_t metadataActionLookup = {}, arsActionLookup = {};
     if (isAclMetaDataSupported())
     {
         metadataActionLookup = aclMetadataDscpActionLookup;
     }
-    for (const auto& action_map: {aclL3ActionLookup, aclMirrorStageLookup, aclDTelActionLookup, metadataActionLookup})
+    if (isAclArsSupported())
+    {
+        arsActionLookup = aclArsActionLookup;
+    }
+    for (const auto& action_map: {aclL3ActionLookup, aclMirrorStageLookup, aclDTelActionLookup, metadataActionLookup, arsActionLookup})
     {
         for (const auto& it: action_map)
         {
@@ -5091,6 +5124,15 @@ uint16_t AclOrch::getAclMetaDataMax() const
         return uint16_t(std::stoi(m_switchMetaDataCapabilities.at(TABLE_ACL_USER_META_DATA_MAX)));
     }
     return 0;
+}
+
+bool AclOrch::isAclArsSupported() const
+{
+    if (m_switchArsCapabilities[ACL_ENTRY_ACTION_DISABLE_ARS_CAPABLE] == "true")
+    {
+        return true;
+    }
+    return false;
 }
 
 bool AclOrch::isUsingEgrSetDscp(const string& table) const

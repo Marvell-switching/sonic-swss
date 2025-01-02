@@ -1757,6 +1757,7 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
     bool isFineGrainedNextHopIdChanged = false;
     bool blackhole = false;
     bool srv6_nh = false;
+    std::set<IpAddress> altPathMembers;
 
     if (m_syncdRoutes.find(vrf_id) == m_syncdRoutes.end())
     {
@@ -1912,7 +1913,7 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
             nhg_attrs.push_back(nhg_attr);
 
             sai_object_id_t ars_object_id;
-            if (m_gArsOrch && m_gArsOrch->isRouteArs(vrf_id, ipPrefix, &ars_object_id))
+            if (m_gArsOrch && m_gArsOrch->isRouteArs(vrf_id, ipPrefix, &ars_object_id), &altPathMembers)
             {
                 nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID;
                 nhg_attr.value.oid = ars_object_id;
@@ -1975,6 +1976,10 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
         }
 
         next_hop_id = m_syncdNextHopGroups[nextHops].next_hop_group_id;
+        if (!updateNexthopArsState(nextHops, altPathMembers))
+        {
+            return false;
+        }
     }
 
     /* Sync the route entry */
@@ -2864,6 +2869,7 @@ inline void RouteOrch::removeVipRouteSubnetDecapTerm(const IpPrefix &ipPrefix)
 bool RouteOrch::reconfigureRoute(sai_object_id_t vrf_id, IpPrefix& ip_prefix, const NextHopGroupKey& nhg)
 {
     SWSS_LOG_NOTICE("Reconfiguring nexthops %s for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
+    std::set<IpAddress> altPathMembers;
     auto it_route = m_syncdRoutes.at(vrf_id).find(ip_prefix);
     if (it_route != m_syncdRoutes.at(vrf_id).end())
     {
@@ -2881,7 +2887,7 @@ bool RouteOrch::reconfigureRoute(sai_object_id_t vrf_id, IpPrefix& ip_prefix, co
         nhg_attrs.push_back(nhg_attr);
 
         sai_object_id_t ars_object_id;
-        if (m_gArsOrch && m_gArsOrch->isRouteArs(vrf_id, ip_prefix, &ars_object_id))
+        if (m_gArsOrch && m_gArsOrch->isRouteArs(vrf_id, ip_prefix, &ars_object_id, &altPathMembers))
         {
             nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID;
             nhg_attr.value.oid = ars_object_id;
@@ -2893,8 +2899,40 @@ bool RouteOrch::reconfigureRoute(sai_object_id_t vrf_id, IpPrefix& ip_prefix, co
             SWSS_LOG_ERROR("Failed to add nexthopgroup %s for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
             return false;
         }
+        if (!updateNexthopArsState(nhg, altPathMembers))
+        {
+            return false;
+        }
     }
     SWSS_LOG_NOTICE("Reconfigured nexthopgroup %s for prefix %s", nhg.to_string().c_str(), ip_prefix.to_string().c_str());
 
+    return true;
+}
+bool RouteOrch::updateNexthopArsState(const NextHopGroupKey& nhg, const std::set<IpAddress>& altPathMembers)
+{
+    if (m_gArsOrch && !altPathMembers.empty())
+    {
+        for (auto it: altPathMembers)
+        {
+            auto nexthop = m_syncdNextHopGroups[nhg].nhopgroup_members.find(it);
+            if (nexthop != m_syncdNextHopGroups[nhg].nhopgroup_members.end())
+            {
+                sia_attribute_t nhgm_attr;
+                nhgm_attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_ARS_OBJECT_ID;
+                nhgm_attr.value.booldata = true;
+                sai_status_t sai_status = sai_next_hop_group_api->set_next_hop_group_member(nexthop->second.next_hop_id, &nhgm_attr);
+                if (sai_status != SAI_STATUS_SUCCESS)
+                {
+                    SWSS_LOG_ERROR("Failed to enable ARS on next hop member %s(oid %" PRIx64 ") : %d",
+                                    nexthop.to_string().c_str(), nexthop->second.next_hop_id, status);
+                    task_process_status handle_status = handleSaiCreateStatus(SAI_API_NEXT_HOP_GROUP, sai_status);
+                    if (handle_status != task_success)
+                    {
+                        return parseHandleSaiStatusFailure(handle_status);
+                    }
+                }
+            }
+        }
+    }
     return true;
 }
