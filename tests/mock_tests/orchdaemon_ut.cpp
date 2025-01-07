@@ -18,6 +18,7 @@ namespace orchdaemon_test
     DBConnector state_db("STATE_DB", 0);
     DBConnector config_db("CONFIG_DB", 0);
     DBConnector counters_db("COUNTERS_DB", 0);
+    DBConnector dynamic_db("DYNAMIC_DB", 0);
 
     class OrchDaemonTest : public ::testing::Test
     {
@@ -33,7 +34,7 @@ namespace orchdaemon_test
                 sai_switch_api->get_switch_attribute = &mock_get_switch_attribute;
                 sai_switch_api->set_switch_attribute = &mock_set_switch_attribute;
 
-                orchd = new OrchDaemon(&appl_db, &config_db, &state_db, &counters_db, nullptr);
+                orchd = new OrchDaemon(&appl_db, &config_db, &state_db, &counters_db, &dynamic_db, nullptr);
 
             };
 

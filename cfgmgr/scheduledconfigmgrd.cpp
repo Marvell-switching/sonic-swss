@@ -29,14 +29,14 @@ int main(int argc, char **argv)
         // Create DB connectors
         DBConnector cfgDb("CONFIG_DB", 0);
         DBConnector stateDb("STATE_DB", 0);
-        DBConnector appDb("APPL_DB", 0);
+        DBConnector dynDb("DYNAMIC_DB", 0);
         
         // Create table connectors that ScheduledConfigMgr will subscribe to
         TableConnector cfgDbScheduledConfigurations(&cfgDb, CFG_SCHEDULED_CONFIGURATION_TABLE_NAME);
         TableConnector stateDbTimeRangeStatusTable(&stateDb, STATE_TIME_RANGE_STATUS_TABLE_NAME);
         vector<TableConnector> connectors = {cfgDbScheduledConfigurations, stateDbTimeRangeStatusTable};
 
-        cfgOrchList.emplace_back(new ScheduledConfigMgr(connectors, &appDb));
+        cfgOrchList.emplace_back(new ScheduledConfigMgr(connectors, &dynDb));
 
         auto scheduledconfigmgr = cfgOrchList[0];
 

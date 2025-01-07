@@ -72,12 +72,13 @@ event_handle_t g_events_handle;
 #define DEFAULT_MAX_BULK_SIZE 1000
 size_t gMaxBulkSize = DEFAULT_MAX_BULK_SIZE;
 
-OrchDaemon::OrchDaemon(DBConnector *applDb, DBConnector *configDb, DBConnector *stateDb, DBConnector *chassisAppDb, ZmqServer *zmqServer) :
+OrchDaemon::OrchDaemon(DBConnector *applDb, DBConnector *configDb, DBConnector *stateDb, DBConnector *chassisAppDb, DBConnector *dynDb, ZmqServer *zmqServer) :
         m_applDb(applDb),
         m_configDb(configDb),
         m_stateDb(stateDb),
         m_chassisAppDb(chassisAppDb),
-        m_zmqServer(zmqServer)
+        m_zmqServer(zmqServer),
+        m_dynDb(dynDb)
 {
     SWSS_LOG_ENTER();
     m_select = new Select();
@@ -332,9 +333,9 @@ bool OrchDaemon::init()
     TableConnector confDbAclTable(m_configDb, CFG_ACL_TABLE_TABLE_NAME);
     TableConnector confDbAclTableType(m_configDb, CFG_ACL_TABLE_TYPE_TABLE_NAME);
     TableConnector confDbAclRuleTable(m_configDb, CFG_ACL_RULE_TABLE_NAME);
-    TableConnector appDbAclTable(m_applDb, APP_ACL_TABLE_TABLE_NAME);
-    TableConnector appDbAclTableType(m_applDb, APP_ACL_TABLE_TYPE_TABLE_NAME);
-    TableConnector appDbAclRuleTable(m_applDb, APP_ACL_RULE_TABLE_NAME);
+    TableConnector appDbAclTable(m_dynDb, APP_ACL_TABLE_TABLE_NAME);
+    TableConnector appDbAclTableType(m_dynDb, APP_ACL_TABLE_TYPE_TABLE_NAME);
+    TableConnector appDbAclRuleTable(m_dynDb, APP_ACL_RULE_TABLE_NAME);
 
     vector<TableConnector> acl_table_connectors = {
         confDbAclTableType,
@@ -1104,8 +1105,8 @@ void OrchDaemon::freezeAndHeartBeat(unsigned int duration)
     }
 }
 
-FabricOrchDaemon::FabricOrchDaemon(DBConnector *applDb, DBConnector *configDb, DBConnector *stateDb, DBConnector *chassisAppDb, ZmqServer *zmqServer) :
-    OrchDaemon(applDb, configDb, stateDb, chassisAppDb, zmqServer),
+FabricOrchDaemon::FabricOrchDaemon(DBConnector *applDb, DBConnector *configDb, DBConnector *stateDb, DBConnector *chassisAppDb, DBConnector *dynamicDb, ZmqServer *zmqServer) :
+    OrchDaemon(applDb, configDb, stateDb, chassisAppDb, dynamicDb, zmqServer),
     m_applDb(applDb),
     m_configDb(configDb)
 {

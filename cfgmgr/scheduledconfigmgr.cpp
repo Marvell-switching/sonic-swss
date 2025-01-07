@@ -14,9 +14,9 @@ using namespace std;
 using namespace swss;
 using json = nlohmann::json;
 
-ScheduledConfigMgr::ScheduledConfigMgr(vector<TableConnector> &connectors, DBConnector *appDb) : Orch(connectors)
+ScheduledConfigMgr::ScheduledConfigMgr(vector<TableConnector> &connectors, DBConnector *dynDb) : Orch(connectors)
 {
-    m_appDb = appDb;
+    m_dynDb = dynDb;
 }
 
 string ScheduledConfigMgr::findTimeRangeByConfiguration(string scheduledConfigurationName) {
@@ -131,7 +131,7 @@ bool ScheduledConfigMgr::applyTableConfiguration(const std::string &tableName, c
     SWSS_LOG_ENTER();
 
     // Create a Table object for the given tableName
-    ProducerStateTable tableObj(m_appDb, tableName);
+    ProducerStateTable tableObj(m_dynDb, tableName);
     
     // Extract the key and fieldValues from the JSON object
     for (auto it = tableKeyFields.begin(); it != tableKeyFields.end(); ++it) {
@@ -162,7 +162,7 @@ bool ScheduledConfigMgr::removeTableConfiguration(const string &tableName, const
     SWSS_LOG_ENTER();
 
     // Create a Table object for the given tableName
-    ProducerStateTable tableObj(m_appDb, tableName);
+    ProducerStateTable tableObj(m_dynDb, tableName);
 
     // Create a Table object and set the field values
     tableObj.del(key);

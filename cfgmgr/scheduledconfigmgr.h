@@ -21,11 +21,11 @@ namespace swss {
 class ScheduledConfigMgr : public Orch
 {
 public:
-    ScheduledConfigMgr(std::vector<TableConnector>& connectors, DBConnector* appDb);
+    ScheduledConfigMgr(std::vector<TableConnector>& connectors, DBConnector* dynDb);
     using Orch::doTask;
 
 private:
-    DBConnector *m_appDb;
+    DBConnector *m_dynDb;
     TimeRangeConfigMap scheduledConfigurations, unboundConfigurations;
     ConfigStatus scheduledConfigurationStatus;
 

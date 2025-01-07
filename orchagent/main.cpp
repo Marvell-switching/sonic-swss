@@ -489,6 +489,7 @@ int main(int argc, char **argv)
     DBConnector appl_db("APPL_DB", 0);
     DBConnector config_db("CONFIG_DB", 0);
     DBConnector state_db("STATE_DB", 0);
+    DBConnector dynamic_db("DYNAMIC_DB", 0);
 
     // Instantiate ZMQ server
     shared_ptr<ZmqServer> zmq_server = nullptr;
@@ -787,7 +788,7 @@ int main(int argc, char **argv)
     shared_ptr<OrchDaemon> orchDaemon;
     if (gMySwitchType != "fabric")
     {
-        orchDaemon = make_shared<OrchDaemon>(&appl_db, &config_db, &state_db, chassis_app_db.get(), zmq_server.get());
+        orchDaemon = make_shared<OrchDaemon>(&appl_db, &config_db, &state_db, chassis_app_db.get(), &dynamic_db, zmq_server.get());
         if (gMySwitchType == "voq")
         {
             orchDaemon->setFabricEnabled(true);
@@ -797,7 +798,7 @@ int main(int argc, char **argv)
     }
     else
     {
-        orchDaemon = make_shared<FabricOrchDaemon>(&appl_db, &config_db, &state_db, chassis_app_db.get(), zmq_server.get());
+        orchDaemon = make_shared<FabricOrchDaemon>(&appl_db, &config_db, &state_db, chassis_app_db.get(), &dynamic_db, zmq_server.get());
     }
 
     if (!orchDaemon->init())
