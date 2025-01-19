@@ -686,4 +686,19 @@ private:
     FlexCounterManager m_flex_counter_manager;
 };
 
+class AclRuleArs: public AclRule
+{
+public:
+    AclRuleArs (AclOrch *m_pAclOrch, string rule, string table): AclRule(aclOrch, rule, table, createCounter);
+    bool validateAddAction(string attr_name, string attr_value);
+    bool validate();
+    bool createRule();
+    bool removeRule();
+    bool activate();
+    bool deactivate();
+protected:
+    protected:
+    bool m_state {false};
+};
+
 #endif /* SWSS_ACLORCH_H */

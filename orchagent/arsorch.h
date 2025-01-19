@@ -27,7 +27,7 @@ enum ArsAssignMode
 
 typedef struct ArsObjectEntry
 {
-    string name;                                    // Name of ARS object configured by user
+    std::string profile_name;                       // Name of ARS profile this object belong to
     ArsAssignMode assign_mode;                      // Stores an assign_mode from ArsAssignModes
     uint32_t flowlet_idle_time;                     // Flowlet idle time in micro seconds
     uint32_t max_flows;                             // Maximum number of flows in a flowlet
@@ -85,7 +85,7 @@ typedef struct ArsProfileEntry
 
     bool ipv4_enabled;                                      // Enable IPv4
     bool ipv6_enabled;                                      // Enable IPv6
-    set<std::string> ars_objects;                           // ARS Objects for the profile
+    uint32_t ref_count;                                     // Number of objects using this profile
     sai_object_id_t m_sai_ars_id;                           // SAI ARS profile OID
 } ArsProfileEntry;
 
@@ -104,7 +104,7 @@ typedef std::set<string> ArsEnabledInterfaces;             // ARS-Enabled interf
 class ArsOrch : public Orch, public Observer
 {
 public:
-    ArsOrch(DBConnector *db, DBConnector *appDb, DBConnector *stateDb, vector<table_name_with_pri_t> &tableNames);
+    ArsOrch(DBConnector *db, DBConnector *appDb, DBConnector *stateDb, vector<table_name_with_pri_t> &tableNames, VRFOrch *vrfOrch);
 
     bool setArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t> &ars_attrs);
     bool createArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t> &ars_attrs);
@@ -117,6 +117,20 @@ public:
     bool bake() override;
     void update(SubjectType type, void *cntx);
 
+protected:
+    VRFOrch *m_vrfOrch;
+    std::shared_ptr<DBConnector> m_counter_db;
+    std::shared_ptr<DBConnector> m_asic_db;
+    std::unique_ptr<Table> m_lag_counter_table;
+    std::unique_ptr<Table> m_nhg_counter_table;
+    std::unique_ptr<Table> m_vidToRidTable;
+
+    SelectableTimer* m_LagFlexCounterUpdTimer = nullptr;
+    SelectableTimer* m_NhgFlexCounterUpdTimer = nullptr;
+
+    std::map<sai_object_id_t, std::string> m_pendingLagAddToFlexCntr;
+    std::map<sai_object_id_t, std::string> m_pendingNhgAddToFlexCntr;
+
 private:
     bool m_isArsSupported = false;
     ArsProfiles m_arsProfiles;
@@ -124,8 +138,12 @@ private:
     ArsPrefixesTables m_arsNexthopGroupPrefixes;
     ArsEnabledInterfaces m_arsEnabledInterfaces;
     ArsLags m_arsLags;
-    VRFOrch *m_vrfOrch;
-
+    FlexCounterManager  m_lag_counter_manager;
+    FlexCounterManager  m_nhg_counter_manager;
+    std::unique_ptr<Table> m_arsProfileStateTable;
+    std::unique_ptr<Table> m_arsIfStateTable;
+    std::unique_ptr<Table> m_arsNhgStateTable;
+    std::unique_ptr<Table> m_arsLagStateTable;
 
     bool updateArsInterface(ArsProfileEntry &profile, const Port &port, const bool is_enable);
     bool doTaskArsObject(const KeyOpFieldsValuesTuple&);

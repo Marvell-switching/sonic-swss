@@ -230,6 +230,10 @@ public:
     const RouteTables& getSyncdRoutes() const { return m_syncdRoutes; }
     bool reconfigureRoute(sai_object_id_t vrf_id, IpPrefix& ip_prefix, const NextHopGroupKey& nhg);
 
+    bool updateNexthopArsState(const NextHopGroupKey& nhg, const std::set<IpAddress>& altPathMembers);
+    bool updateNexthopGroupArsState(const sai_object_id next_hop_group_id, const sai_object_id ars_object_id);
+    bool reconfigureNexthopGroupWithArsState(NextHopGroupKey nexthopGroupKey, sai_object_id * next_hop_group_id, const sai_object_id ars_object_id);
+
 private:
     SwitchOrch *m_switchOrch;
     NeighOrch *m_neighOrch;
