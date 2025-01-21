@@ -63,6 +63,7 @@ tests_SOURCES = aclorch_ut.cpp \
                 neighorch_ut.cpp \
                 dashorch_ut.cpp \
                 twamporch_ut.cpp \
+                stporch_ut.cpp \
                 flexcounter_ut.cpp \
                 mock_orch_test.cpp \
                 $(top_srcdir)/warmrestart/warmRestartHelper.cpp \
@@ -140,6 +141,7 @@ tests_SOURCES = aclorch_ut.cpp \
                 $(top_srcdir)/orchagent/dash/pbutils.cpp \
                 $(top_srcdir)/cfgmgr/coppmgr.cpp \
                 $(top_srcdir)/orchagent/twamporch.cpp \
+                $(top_srcdir)/orchagent/stporch.cpp
                 $(top_srcdir)/orchagent/arsorch.cpp
 
 tests_SOURCES += $(FLEX_CTR_DIR)/flex_counter_manager.cpp $(FLEX_CTR_DIR)/flex_counter_stat_manager.cpp $(FLEX_CTR_DIR)/flow_counter_handler.cpp $(FLEX_CTR_DIR)/flowcounterrouteorch.cpp
@@ -226,8 +228,8 @@ tests_teammgrd_SOURCES = teammgrd/teammgr_ut.cpp \
 tests_teammgrd_INCLUDES = $(tests_INCLUDES) -I$(top_srcdir)/cfgmgr -I$(top_srcdir)/lib
 tests_teammgrd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTEST) $(CFLAGS_SAI)
 tests_teammgrd_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTEST) $(CFLAGS_SAI) $(tests_teammgrd_INCLUDES)
-tests_teammgrd_LDADD = $(LDADD_GTEST) $(LDADD_SAI) -lnl-genl-3 -lhiredis -lhiredis \
-        -lswsscommon -lswsscommon -lgtest -lgtest_main -lzmq -lnl-3 -lnl-route-3 -lpthread -lgmock -lgmock_main
+tests_teammgrd_LDADD = $(LDADD_GTEST) $(LDADD_SAI) -ldl -lhiredis \
+        -lswsscommon -lgtest -lgtest_main -lzmq -lpthread -lgmock -lgmock_main
 
 ## fpmsyncd unit tests
 

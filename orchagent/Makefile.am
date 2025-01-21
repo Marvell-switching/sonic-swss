@@ -20,7 +20,7 @@ dist_swss_DATA = \
 		 pfc_detect_marvell_teralynx.lua  \
 		 pfc_detect_mellanox.lua  \
 		 pfc_detect_broadcom.lua \
-		 pfc_detect_marvell.lua \
+		 pfc_detect_marvell_prestera.lua \
 		 pfc_detect_barefoot.lua \
 		 pfc_detect_nephos.lua \
 		 pfc_detect_cisco-8000.lua \
@@ -115,6 +115,7 @@ orchagent_SOURCES = \
             dash/dashtagmgr.cpp \
             dash/pbutils.cpp \
             twamporch.cpp \
+            stporch.cpp \
             arsorch.cpp
 
 orchagent_SOURCES += flex_counter/flex_counter_manager.cpp flex_counter/flex_counter_stat_manager.cpp flex_counter/flow_counter_handler.cpp flex_counter/flowcounterrouteorch.cpp
