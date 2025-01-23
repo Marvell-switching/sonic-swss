@@ -15,6 +15,7 @@
 #include "nexthopgroupkey.h"
 #include "bulker.h"
 #include "fgnhgorch.h"
+#include "arsorch.h"
 #include <map>
 
 /* Maximum next hop group number */
@@ -184,7 +185,7 @@ struct LabelRouteBulkContext
 class RouteOrch : public Orch, public Subject
 {
 public:
-    RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch, FgNhgOrch *fgNhgOrch, Srv6Orch *srv6Orch);
+    RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch, FgNhgOrch *fgNhgOrch, Srv6Orch *srv6Orch, ArsOrch *gArsOrch);
 
     bool hasNextHopGroup(const NextHopGroupKey&) const;
     sai_object_id_t getNextHopGroupId(const NextHopGroupKey&);
@@ -229,6 +230,11 @@ public:
     void decreaseNextHopGroupCount();
     bool checkNextHopGroupCount();
     const RouteTables& getSyncdRoutes() const { return m_syncdRoutes; }
+    bool reconfigureRoute(sai_object_id_t vrf_id, IpPrefix& ip_prefix, const NextHopGroupKey& nhg);
+
+    bool updateNexthopArsState(const NextHopGroupKey& nhg, const std::set<IpAddress>& altPathMembers);
+    bool updateNexthopGroupArsState(const sai_object_id next_hop_group_id, const sai_object_id ars_object_id);
+    bool reconfigureNexthopGroupWithArsState(NextHopGroupKey nexthopGroupKey, sai_object_id * next_hop_group_id, const sai_object_id ars_object_id);
 
 private:
     SwitchOrch *m_switchOrch;
@@ -237,6 +243,7 @@ private:
     VRFOrch *m_vrfOrch;
     FgNhgOrch *m_fgNhgOrch;
     Srv6Orch *m_srv6Orch;
+    ArsOrch *m_gArsOrch;
 
     unsigned int m_nextHopGroupCount;
     unsigned int m_maxNextHopGroupCount;
@@ -288,6 +295,9 @@ private:
     bool isVipRoute(const IpPrefix &ipPrefix, const NextHopGroupKey &nextHops);
     void createVipRouteSubnetDecapTerm(const IpPrefix &ipPrefix);
     void removeVipRouteSubnetDecapTerm(const IpPrefix &ipPrefix);
+
+    bool addNextHopGroup(const NextHopGroupKey&, vector<sai_attribute_t> &nhg_attrs);
+    bool updateNexthopArsState(const NextHopGroupKey& nhg, const std::set<IpAddress>& altPathMembers);
 };
 
 #endif /* SWSS_ROUTEORCH_H */

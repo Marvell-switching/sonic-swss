@@ -422,6 +422,26 @@ bool OrchDaemon::init()
 
     gNhgMapOrch = new NhgMapOrch(m_applDb, APP_FC_TO_NHG_INDEX_MAP_TABLE_NAME);
 
+    const int arsorch_pri = 15;
+
+    vector<table_name_with_pri_t> ars_tables = {
+        { CFG_ARS_PROFILE,                       arsorch_pri },
+        { CFG_ARS_QUANTIZATION_BANDS,            arsorch_pri },
+        { CFG_ARS_OBJECT,                        arsorch_pri },
+        { CFG_ARS_INTERFACE,                     arsorch_pri },
+        { CFG_ARS_NEXTHOP_GROUP,                 arsorch_pri },
+        { CFG_ARS_PORTCHANNEL,                   arsorch_pri },
+        { APP_ARS_PROFILE_TABLE_NAME,            arsorch_pri },
+        { APP_ARS_QUANTIZATION_BANDS_TABLE_NAME, arsorch_pri },
+        { APP_ARS_OBJECT_TABLE_NAME,             arsorch_pri },
+        { APP_ARS_INTERFACE_TABLE_NAME,          arsorch_pri },
+        { APP_ARS_NEXTHOP_GROUP_TABLE_NAME,      arsorch_pri },
+        { APP_ARS_PORTCHANNEL_TABLE_NAME,        arsorch_pri }
+    };
+
+    ArsOrch* ars_orch = new ArsOrch(m_configDb, m_applDb, m_stateDb, ars_tables, vrf_orch);
+    gDirectory.set(ars_orch);
+
     /*
      * The order of the orch list is important for state restore of warm start and
      * the queued processing in m_toSync map after gPortsOrch->allPortsReady() is set.
@@ -528,6 +548,7 @@ bool OrchDaemon::init()
     m_orchList.push_back(gMlagOrch);
     m_orchList.push_back(gIsoGrpOrch);
     m_orchList.push_back(gFgNhgOrch);
+    m_orchList.push_back(ars_orch);
     m_orchList.push_back(mux_st_orch);
     m_orchList.push_back(nvgre_tunnel_orch);
     m_orchList.push_back(nvgre_tunnel_map_orch);

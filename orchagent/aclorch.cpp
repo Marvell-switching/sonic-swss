@@ -11,6 +11,7 @@
 #include "timer.h"
 #include "crmorch.h"
 #include "sai_serialize.h"
+#include "directory.h"
 
 using namespace std;
 using namespace swss;
@@ -30,6 +31,7 @@ extern PortsOrch*        gPortsOrch;
 extern CrmOrch *gCrmOrch;
 extern SwitchOrch *gSwitchOrch;
 extern string gMySwitchType;
+extern Directory<Orch*> gDirectory;
 
 #define MIN_VLAN_ID 1    // 0 is a reserved VLAN ID
 #define MAX_VLAN_ID 4095 // 4096 is a reserved VLAN ID
@@ -123,6 +125,11 @@ static acl_rule_attr_lookup_t aclDTelActionLookup =
 static acl_rule_attr_lookup_t aclOtherActionLookup =
 {
     { ACTION_COUNTER,                       SAI_ACL_ENTRY_ATTR_ACTION_COUNTER}
+};
+
+static acl_rule_attr_lookup_t aclArsActionLookup =
+{
+    { ACTION_DISABLE_ARS_FORWARDING,        SAI_ACL_ENTRY_ATTR_ACTION_DISABLE_ARS_FORWARDING}
 };
 
 static acl_packet_action_lookup_t aclPacketActionLookup =
@@ -399,6 +406,16 @@ static acl_table_action_list_lookup_t defaultAclActionList =
                 {
                     SAI_ACL_ACTION_TYPE_SET_DSCP
                 }
+            }
+        }
+    },
+    {
+        // ARS
+        TABLE_TYPE_ARS,
+        {
+            ACL_STAGE_INGRESS,
+            {
+                SAI_ACL_ACTION_TYPE_DISABLE_ARS_FORWARDING
             }
         }
     }
@@ -771,6 +788,8 @@ bool AclTableTypeParser::parseAclTableTypeActions(const std::string& value, AclT
         auto dtelAction = aclDTelActionLookup.find(action);
         auto otherAction = aclOtherActionLookup.find(action);
         auto metadataAction = aclMetadataDscpActionLookup.find(action);
+        auto arsAction = aclArsActionLookup.find(action);
+
         if (l3Action != aclL3ActionLookup.end())
         {
             saiActionAttr = l3Action->second;
@@ -790,6 +809,10 @@ bool AclTableTypeParser::parseAclTableTypeActions(const std::string& value, AclT
         else if (metadataAction != aclMetadataDscpActionLookup.end())
         {
             saiActionAttr = metadataAction->second;
+        }
+        else if (arsAction != aclArsActionLookup.end())
+        {
+            saiActionAttr = arsAction->second;
         }
         else
         {
@@ -1728,6 +1751,11 @@ shared_ptr<AclRule> AclRule::makeShared(AclOrch *acl, MirrorOrch *mirror, DTelOr
             }
 
             return make_shared<AclRuleDTelWatchListEntry>(acl, dtel, rule, table);
+        }
+        else if (aclArsActionLookup.find(action) != aclArsActionLookup.cend())
+        {
+            ArsOrch* ars_orch = gDirectory.get<ArsOrch*>();
+            return make_shared<AclRuleArs>(acl, ars_orch, rule, table);
         }
     }
 
@@ -3383,6 +3411,7 @@ void AclOrch::init(vector<TableConnector>& connectors, PortsOrch *portOrch, Mirr
         m_switchMetaDataCapabilities[TABLE_ACL_ENTRY_ATTR_META_CAPABLE] = "true";
         m_switchMetaDataCapabilities[TABLE_ACL_ENTRY_ACTION_META_CAPABLE] = "true";
         m_metaDataMgr.populateRange(1,7);
+        m_switchArsCapabilities[ACL_ENTRY_ACTION_DISABLE_ARS_CAPABLE] = "true";
     }
     else
     {
@@ -3400,6 +3429,7 @@ void AclOrch::init(vector<TableConnector>& connectors, PortsOrch *portOrch, Mirr
         m_switchMetaDataCapabilities[TABLE_ACL_USER_META_DATA_RANGE_CAPABLE] = "false";
         m_switchMetaDataCapabilities[TABLE_ACL_ENTRY_ATTR_META_CAPABLE] = "false";
         m_switchMetaDataCapabilities[TABLE_ACL_ENTRY_ACTION_META_CAPABLE] = "false";
+        m_switchArsCapabilities[ACL_ENTRY_ACTION_DISABLE_ARS_CAPABLE] = "false";
 
         status = sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_SWITCH, SAI_SWITCH_ATTR_ACL_USER_META_DATA_RANGE, &capability);
         if (status != SAI_STATUS_SUCCESS)
@@ -3475,7 +3505,23 @@ void AclOrch::init(vector<TableConnector>& connectors, PortsOrch *portOrch, Mirr
 
         m_metaDataMgr.populateRange(metadataMin, metadataMax);
 
+        status = sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_ACL_ENTRY, SAI_ACL_ENTRY_ATTR_ACTION_DISABLE_ARS_FORWARDING, &capability);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_WARN("Could not query SAI_ACL_ENTRY_ATTR_ACTION_DISABLE_ARS_FORWARDING %d", status);
+        }
+        else
+        {
+            if (capability.set_implemented)
+            {
+                m_switchArsCapabilities[ACL_ENTRY_ACTION_DISABLE_ARS_CAPABLE] = "true";
+            }
+
+            SWSS_LOG_NOTICE("SAI_ACL_ENTRY_ATTR_ACTION_DISABLE_ARS_FORWARDING capability %d", capability.set_implemented);
+        }
     }
+
+
     // Store the capabilities in state database
     // TODO: Move this part of the code into syncd
     vector<FieldValueTuple> fvVector;
@@ -3784,6 +3830,28 @@ void AclOrch::initDefaultTableTypes(const string& platform, const string& sub_pl
     }
     // Placeholder for control plane tables
     addAclTableType(builder.withName(TABLE_TYPE_CTRLPLANE).build());
+
+    addAclTableType(
+        builder.withName(TABLE_TYPE_ARS)
+            .withBindPointType(SAI_ACL_BIND_POINT_TYPE_PORT)
+            .withBindPointType(SAI_ACL_BIND_POINT_TYPE_LAG)
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_ETHER_TYPE))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_OUTER_VLAN_ID))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_ACL_IP_TYPE))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_SRC_IP))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_DST_IP))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_ICMP_TYPE))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_ICMP_CODE))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_IP_PROTOCOL))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_L4_SRC_PORT))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_L4_DST_PORT))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_TCP_FLAGS))
+            .withMatch(make_shared<AclTableMatch>(SAI_ACL_TABLE_ATTR_FIELD_OUT_PORTS))
+            .withMatch(make_shared<AclTableRangeMatch>(set<sai_acl_range_type_t>{
+                {SAI_ACL_RANGE_TYPE_L4_SRC_PORT_RANGE, SAI_ACL_RANGE_TYPE_L4_DST_PORT_RANGE}}))
+            .build()
+    );
+
 }
 
 void AclOrch::queryAclActionCapability()
@@ -3879,12 +3947,16 @@ void AclOrch::putAclActionCapabilityInDB(acl_stage_type_t stage)
     string delimiter;
     ostringstream acl_action_value_stream;
     ostringstream is_action_list_mandatory_stream;
-    acl_rule_attr_lookup_t metadataActionLookup = {};
+    acl_rule_attr_lookup_t metadataActionLookup = {}, arsActionLookup = {};
     if (isAclMetaDataSupported())
     {
         metadataActionLookup = aclMetadataDscpActionLookup;
     }
-    for (const auto& action_map: {aclL3ActionLookup, aclMirrorStageLookup, aclDTelActionLookup, metadataActionLookup})
+    if (isAclArsSupported())
+    {
+        arsActionLookup = aclArsActionLookup;
+    }
+    for (const auto& action_map: {aclL3ActionLookup, aclMirrorStageLookup, aclDTelActionLookup, metadataActionLookup, arsActionLookup})
     {
         for (const auto& it: action_map)
         {
@@ -5093,6 +5165,15 @@ uint16_t AclOrch::getAclMetaDataMax() const
     return 0;
 }
 
+bool AclOrch::isAclArsSupported() const
+{
+    if (m_switchArsCapabilities[ACL_ENTRY_ACTION_DISABLE_ARS_CAPABLE] == "true")
+    {
+        return true;
+    }
+    return false;
+}
+
 bool AclOrch::isUsingEgrSetDscp(const string& table) const
 {
     if (m_egrSetDscpRef.find(table) != m_egrSetDscpRef.end())
@@ -5999,4 +6080,80 @@ void MetaDataMgr::recycleMetaData(uint16_t metadata)
     {
         SWSS_LOG_ERROR("Unexpected: Metadata free before Initialization complete.");
     }
+}
+
+bool AclRuleArs::validateAddAction(string attr_name, string attr_value)
+{
+    SWSS_LOG_ENTER();
+
+    SWSS_LOG_INFO("Name %s Value %s", attr_name.c_str(), attr_value.c_str());
+
+    sai_acl_entry_attr_t action;
+    const auto it = aclArsActionLookup.find(attr_name);
+    if (it != aclArsActionLookup.cend())
+    {
+        action = it->second;
+    }
+    else
+    {
+        return false;
+    }
+
+    sai_acl_action_data_t actionData;
+    actionData.enable = true;
+    actionData.parameter.booldata = (attr_value == "true") ? true : false;
+    return setAction(action, actionData);
+}
+
+bool AclRuleArs::createRule()
+{
+    SWSS_LOG_ENTER();
+
+    return activate();
+}
+
+bool AclRuleArs::removeRule()
+{
+    SWSS_LOG_ENTER();
+
+    return deactivate();
+}
+
+bool AclRuleArs::activate()
+{
+    SWSS_LOG_ENTER();
+    sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+
+    for (auto& it: m_actions)
+    {
+        auto attr = it.second.getSaiAttr();
+        attr.value.aclaction.enable = true;
+        attr.value.aclaction.parameter.objlist.list = &oid;
+        attr.value.aclaction.parameter.objlist.count = 1;
+        setAction(it.first, attr.value.aclaction);
+    }
+
+    if (!AclRule::createRule())
+    {
+        return false;
+    }
+
+    m_state = true;
+    return true;
+}
+
+bool AclRuleArs::deactivate()
+{
+    SWSS_LOG_ENTER();
+    if (!m_state)
+    {
+        return true;
+    }
+    if (!AclRule::removeRule())
+    {
+        return false;
+    }
+
+    m_state = false;
+    return true;
 }
