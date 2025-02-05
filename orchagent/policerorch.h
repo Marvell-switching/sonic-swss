@@ -11,7 +11,7 @@ using namespace std;
 typedef map<string, sai_object_id_t> PolicerTable;
 typedef map<string, int> PolicerRefCountTable;
 
-class PolicerOrch : public Orch, public Observer, public Subject
+class PolicerOrch : public Orch
 {
 public:
     PolicerOrch(vector<TableConnector> &tableNames, PortsOrch *portOrch);
@@ -21,6 +21,7 @@ public:
 
     bool increaseRefCount(const string &name);
     bool decreaseRefCount(const string &name);
+    int getRefCount(const string &name);
     task_process_status handlePortStormControlTable(swss::KeyOpFieldsValuesTuple tuple);
 private:
     PortsOrch *m_portsOrch;

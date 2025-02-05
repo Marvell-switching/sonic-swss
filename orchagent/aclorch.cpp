@@ -2088,7 +2088,7 @@ void AclRulePacket::onUpdate(SubjectType, void *)
 AclRulePolicer::AclRulePolicer(AclOrch *aclOrch, PolicerOrch *policer, string rule, string table) :
         AclRule(aclOrch, rule, table),
         m_state(false),
-        m_pMirrorOrch(policer)
+        m_pPolicerOrch(policer)
 {
 }
 
@@ -2147,6 +2147,8 @@ bool AclRulePolicer::createRule()
 
 bool AclRulePolicer::removeRule()
 {
+    SWSS_LOG_ENTER();
+
     return deactivate();
 }
 
@@ -3721,7 +3723,6 @@ void AclOrch::init(vector<TableConnector>& connectors, PortsOrch *portOrch, Mirr
     // Attach observers
     m_mirrorOrch->attach(this);
     gPortsOrch->attach(this);
-    m_policerOrch->attach(this);
 }
 
 void AclOrch::initDefaultTableTypes(const string& platform, const string& sub_platform)
@@ -4237,8 +4238,6 @@ AclOrch::AclOrch(vector<TableConnector>& connectors,
 AclOrch::~AclOrch()
 {
     m_mirrorOrch->detach(this);
-
-    m_policerOrch->detach(this);
 
     if (m_dTelOrch)
     {
@@ -6067,6 +6066,7 @@ bool AclOrch::getAclBindPortId(Port &port, sai_object_id_t &port_id)
 void AclOrch::setAclTableStatus(string table_name, AclObjectStatus status)
 {
     vector<FieldValueTuple> fvVector;
+    SWSS_LOG_NOTICE("changing table '%s' status to '%s'", table_name.c_str(), aclObjectStatusLookup[status].c_str());
     fvVector.emplace_back("status", aclObjectStatusLookup[status]);
     m_aclTableStateTable.set(table_name, fvVector);
 }
@@ -6074,6 +6074,7 @@ void AclOrch::setAclTableStatus(string table_name, AclObjectStatus status)
 // Remove the status record of given ACL table from STATE_DB
 void AclOrch::removeAclTableStatus(string table_name)
 {
+    SWSS_LOG_NOTICE("removing ACL table '%s' status", table_name.c_str());
     m_aclTableStateTable.del(table_name);
 }
 
