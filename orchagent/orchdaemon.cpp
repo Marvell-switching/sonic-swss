@@ -26,6 +26,7 @@ using namespace swss;
 extern sai_switch_api_t*           sai_switch_api;
 extern sai_object_id_t             gSwitchId;
 extern string                      gMySwitchType;
+extern string                      gMySwitchSubType;
 
 extern void syncd_apply_view();
 /*
@@ -256,7 +257,9 @@ bool OrchDaemon::init()
     gDirectory.set(chassis_frontend_orch);
 
     gIntfsOrch = new IntfsOrch(m_applDb, APP_INTF_TABLE_NAME, vrf_orch, m_chassisAppDb);
+    gDirectory.set(gIntfsOrch);
     gNeighOrch = new NeighOrch(m_applDb, APP_NEIGH_TABLE_NAME, gIntfsOrch, gFdbOrch, gPortsOrch, m_chassisAppDb);
+    gDirectory.set(gNeighOrch);
 
     const int fgnhgorch_pri = 15;
 
@@ -269,12 +272,19 @@ bool OrchDaemon::init()
     gFgNhgOrch = new FgNhgOrch(m_configDb, m_applDb, m_stateDb, fgnhg_tables, gNeighOrch, gIntfsOrch, vrf_orch);
     gDirectory.set(gFgNhgOrch);
 
-    vector<string> srv6_tables = {
-        APP_SRV6_SID_LIST_TABLE_NAME,
-        APP_SRV6_MY_SID_TABLE_NAME,
-        APP_PIC_CONTEXT_TABLE_NAME
+    TableConnector srv6_sid_list_table(m_applDb, APP_SRV6_SID_LIST_TABLE_NAME);
+    TableConnector srv6_my_sid_table(m_applDb, APP_SRV6_MY_SID_TABLE_NAME);
+    TableConnector pic_context_table(m_applDb, APP_PIC_CONTEXT_TABLE_NAME);
+    TableConnector srv6_my_sid_cfg_table(m_configDb, CFG_SRV6_MY_SID_TABLE_NAME);
+
+    vector<TableConnector> srv6_tables = {
+        srv6_sid_list_table,
+        srv6_my_sid_table,
+        pic_context_table,
+        srv6_my_sid_cfg_table
     };
-    gSrv6Orch = new Srv6Orch(m_applDb, srv6_tables, gSwitchOrch, vrf_orch, gNeighOrch);
+
+    gSrv6Orch = new Srv6Orch(m_configDb, m_applDb, srv6_tables, gSwitchOrch, vrf_orch, gNeighOrch);
     gDirectory.set(gSrv6Orch);
 
     const int routeorch_pri = 5;
@@ -514,7 +524,7 @@ bool OrchDaemon::init()
     }
 
     gAclOrch = new AclOrch(acl_table_connectors, m_stateDb,
-        gSwitchOrch, gPortsOrch, gMirrorOrch, gNeighOrch, gRouteOrch, dtel_orch);
+        gSwitchOrch, gPortsOrch, gPolicerOrch, gMirrorOrch, gNeighOrch, gRouteOrch, dtel_orch);
 
     vector<string> mlag_tables = {
         { CFG_MCLAG_TABLE_NAME },
@@ -596,6 +606,13 @@ bool OrchDaemon::init()
         };
         gFabricPortsOrch = new FabricPortsOrch(m_applDb, fabric_port_tables, m_fabricPortStatEnabled, m_fabricQueueStatEnabled);
         m_orchList.push_back(gFabricPortsOrch);
+    }
+
+    if (gMySwitchSubType == "SmartSwitch")
+    {
+        DashEniFwdOrch *dash_eni_fwd_orch = new DashEniFwdOrch(m_configDb, m_applDb, APP_DASH_ENI_FORWARD_TABLE, gNeighOrch);
+        gDirectory.set(dash_eni_fwd_orch);
+        m_orchList.push_back(dash_eni_fwd_orch);
     }
 
     vector<string> flex_counter_tables = {

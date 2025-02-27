@@ -15,6 +15,7 @@ extern Srv6Orch  *gSrv6Orch;
 
 extern FdbOrch *gFdbOrch;
 extern MirrorOrch *gMirrorOrch;
+extern PolicerOrch *gPolicerOrch;
 extern VRFOrch *gVrfOrch;
 
 extern sai_acl_api_t *sai_acl_api;
@@ -153,7 +154,7 @@ namespace aclorch_test
         swss::DBConnector *config_db;
 
         MockAclOrch(swss::DBConnector *config_db, swss::DBConnector *state_db, SwitchOrch *switchOrch,
-                    PortsOrch *portsOrch, MirrorOrch *mirrorOrch, NeighOrch *neighOrch, RouteOrch *routeOrch) :
+                    PortsOrch *portsOrch, PolicerOrch* policerOrch, MirrorOrch *mirrorOrch, NeighOrch *neighOrch, RouteOrch *routeOrch) :
             config_db(config_db)
         {
             TableConnector confDbAclTable(config_db, CFG_ACL_TABLE_TABLE_NAME);
@@ -161,8 +162,8 @@ namespace aclorch_test
 
             vector<TableConnector> acl_table_connectors = { confDbAclTable, confDbAclRuleTable };
 
-            m_aclOrch = new AclOrch(acl_table_connectors, state_db, switchOrch, portsOrch, mirrorOrch,
-                                    neighOrch, routeOrch);
+            m_aclOrch = new AclOrch(acl_table_connectors, state_db, switchOrch, portsOrch,
+                                    policerOrch, mirrorOrch, neighOrch, routeOrch);
         }
 
         ~MockAclOrch()
@@ -231,6 +232,66 @@ namespace aclorch_test
         const map<sai_object_id_t, AclTable> &getAclTables() const
         {
             return Portal::AclOrchInternal::getAclTables(m_aclOrch);
+        }
+    };
+
+    struct MockPolicerOrch
+    {
+        PolicerOrch *m_policerOrch;
+        swss::DBConnector *config_db;
+
+        MockPolicerOrch(swss::DBConnector *config_db) :
+            config_db(config_db)
+        {
+            vector<TableConnector> policer_tables = {
+                TableConnector(config_db, CFG_POLICER_TABLE_NAME),
+                TableConnector(config_db, CFG_PORT_STORM_CONTROL_TABLE_NAME)
+            };
+            m_policerOrch = new PolicerOrch(policer_tables, gPortsOrch);
+        }
+
+        ~MockPolicerOrch()
+        {
+            delete m_policerOrch;
+        }
+
+        operator const PolicerOrch *() const
+        {
+            return m_policerOrch;
+        }
+
+        void doPolicerTask(const deque<KeyOpFieldsValuesTuple> &entries)
+        {
+            auto consumer = unique_ptr<Consumer>(new Consumer(
+                new swss::ConsumerStateTable(config_db, CFG_POLICER_TABLE_NAME, 1, 1), m_policerOrch, CFG_POLICER_TABLE_NAME));
+            consumer->addToSync(entries);
+            static_cast<Orch *>(m_policerOrch)->doTask(*consumer);
+        }
+
+        void createPolicer(const string &policerName, const map<string, string> &attributes)
+        {
+            deque<KeyOpFieldsValuesTuple> kvfPolicer = {{
+                policerName, SET_COMMAND, { attributes.begin(), attributes.end() }
+            }};
+            doPolicerTask(kvfPolicer);
+        }
+
+        void deletePolicer(const string &policerName)
+        {
+            deque<KeyOpFieldsValuesTuple> kvfPolicer = {{
+                policerName, DEL_COMMAND, {}
+            }};
+            doPolicerTask(kvfPolicer);
+        }
+
+        bool policerExists(const string &policerName) const
+        {
+            return m_policerOrch->policerExists(policerName);
+        }
+
+        int getPolicerRefCount(const string &policerName) const
+        {
+            return m_policerOrch->getRefCount(policerName);
         }
     };
 
@@ -418,11 +479,16 @@ namespace aclorch_test
             gFgNhgOrch = new FgNhgOrch(m_config_db.get(), m_app_db.get(), m_state_db.get(), fgnhg_tables, gNeighOrch, gIntfsOrch, gVrfOrch);
 
             ASSERT_EQ(gSrv6Orch, nullptr);
-            vector<string> srv6_tables = {
-                APP_SRV6_SID_LIST_TABLE_NAME,
-                APP_SRV6_MY_SID_TABLE_NAME
+            TableConnector srv6_sid_list_table(m_app_db.get(), APP_SRV6_SID_LIST_TABLE_NAME);
+            TableConnector srv6_my_sid_table(m_app_db.get(), APP_SRV6_MY_SID_TABLE_NAME);
+            TableConnector srv6_my_sid_cfg_table(m_config_db.get(), CFG_SRV6_MY_SID_TABLE_NAME);
+
+            vector<TableConnector> srv6_tables = {
+                srv6_sid_list_table,
+                srv6_my_sid_table,
+                srv6_my_sid_cfg_table
             };
-            gSrv6Orch = new Srv6Orch(m_app_db.get(), srv6_tables, gSwitchOrch, gVrfOrch, gNeighOrch);
+            gSrv6Orch = new Srv6Orch(m_config_db.get(), m_app_db.get(), srv6_tables, gSwitchOrch, gVrfOrch, gNeighOrch);
 
             ASSERT_EQ(gRouteOrch, nullptr);
             const int routeorch_pri = 5;
@@ -501,7 +567,7 @@ namespace aclorch_test
 
         shared_ptr<MockAclOrch> createAclOrch()
         {
-            return make_shared<MockAclOrch>(m_config_db.get(), m_state_db.get(), gSwitchOrch, gPortsOrch, gMirrorOrch,
+            return make_shared<MockAclOrch>(m_config_db.get(), m_state_db.get(), gSwitchOrch, gPortsOrch, gPolicerOrch, gMirrorOrch,
                                             gNeighOrch, gRouteOrch);
         }
 
@@ -962,6 +1028,30 @@ namespace aclorch_test
                     return false;
                 }
             }
+            else if (attr_name == MATCH_INNER_SRC_MAC || attr_name == MATCH_INNER_DST_MAC)
+            {
+
+                auto it_field = rule_matches.find(attr_name == MATCH_INNER_SRC_MAC ? SAI_ACL_ENTRY_ATTR_FIELD_INNER_SRC_MAC :
+                                                  SAI_ACL_ENTRY_ATTR_FIELD_INNER_DST_MAC);
+                if (it_field == rule_matches.end())
+                {
+                    return false;
+                }
+
+                if (attr_value != sai_serialize_mac(it_field->second.getSaiAttr().value.aclfield.data.mac))
+                {
+                    std::cerr << "MAC didn't match, Expected:" << attr_value << "\n" \
+                              << "Recieved: " << sai_serialize_mac(it_field->second.getSaiAttr().value.aclfield.data.mac) << "\n" ;
+                    return false;
+                }
+
+                if ("FF:FF:FF:FF:FF:FF" != sai_serialize_mac(it_field->second.getSaiAttr().value.aclfield.mask.mac))
+                {
+                    std::cerr << "MAC Mask didn't match, Expected: FF:FF:FF:FF:FF:FF\n" \
+                              << "Recieved: " << sai_serialize_mac(it_field->second.getSaiAttr().value.aclfield.data.mac) << "\n" ;
+                    return false;
+                }
+            }
             else
             {
                 // unknown attr_name
@@ -985,12 +1075,17 @@ namespace aclorch_test
                         return false;
                     }
                 }
-                else if (attr_name == MATCH_SRC_IP || attr_name == MATCH_DST_IP || attr_name == MATCH_SRC_IPV6)
+                else if (attr_name == MATCH_SRC_IP || attr_name == MATCH_DST_IP || attr_name == MATCH_SRC_IPV6
+                        || attr_name == MATCH_INNER_DST_MAC ||  attr_name == MATCH_INNER_SRC_MAC)
                 {
                     if (!validateAclRuleMatch(acl_rule, attr_name, attr_value))
                     {
                         return false;
                     }
+                }
+                else if (attr_name == RULE_PRIORITY)
+                {
+                    continue;
                 }
                 else
                 {
@@ -1955,4 +2050,121 @@ namespace aclorch_test
         // Restore sai_switch_api.
         sai_switch_api = old_sai_switch_api;
     }
+
+    TEST_F(AclOrchTest, Match_Inner_Mac)
+    {
+        string aclTableTypeName = "MAC_MATCH_TABLE_TYPE";
+        string aclTableName = "MAC_MATCH_TABLE";
+        string aclRuleName = "MAC_MATCH_RULE0";
+
+        auto orch = createAclOrch();
+
+        auto matches = string(MATCH_INNER_DST_MAC) + comma + string(MATCH_INNER_SRC_MAC);
+        orch->doAclTableTypeTask(
+            deque<KeyOpFieldsValuesTuple>(
+            {
+                {
+                    aclTableTypeName,
+                    SET_COMMAND,
+                    {
+                        { ACL_TABLE_TYPE_MATCHES, matches},
+                        { ACL_TABLE_TYPE_ACTIONS, ACTION_PACKET_ACTION }
+                    }
+                }
+            })
+        );
+
+        orch->doAclTableTask(
+            deque<KeyOpFieldsValuesTuple>(
+            {
+                {
+                    aclTableName,
+                    SET_COMMAND,
+                    {
+                        { ACL_TABLE_TYPE, aclTableTypeName },
+                        { ACL_TABLE_STAGE, STAGE_INGRESS }
+                    }
+                }
+            })
+        );
+
+        ASSERT_TRUE(orch->getAclTable(aclTableName));
+
+        auto tableOid = orch->getTableById(aclTableName);
+        ASSERT_NE(tableOid, SAI_NULL_OBJECT_ID);
+        const auto &aclTables = orch->getAclTables();
+        auto it_table = aclTables.find(tableOid);
+        ASSERT_NE(it_table, aclTables.end());
+
+        const auto &aclTableObject = it_table->second;
+
+        auto kvfAclRule = deque<KeyOpFieldsValuesTuple>({
+                {
+                    aclTableName + "|" + aclRuleName,
+                    SET_COMMAND,
+                    {
+                        { RULE_PRIORITY, "9999" },
+                        { MATCH_INNER_DST_MAC, "FF:EE:DD:CC:BB:AA" },
+                        { MATCH_INNER_SRC_MAC, "11:22:33:44:55:66" },
+                        { ACTION_PACKET_ACTION, PACKET_ACTION_DROP }
+                    }
+                }
+        });
+        orch->doAclRuleTask(kvfAclRule);
+
+        auto it_rule = aclTableObject.rules.find(aclRuleName);
+        ASSERT_NE(it_rule, aclTableObject.rules.end());
+        ASSERT_TRUE(validateAclRuleByConfOp(*it_rule->second, kfvFieldsValues(kvfAclRule.front())));
+    }
+
+    TEST_F(AclOrchTest, ValidateAclPolicerIntegration)
+    {
+        const string aclTableTypeName = "CUSTOM_POLICER_TYPE";
+        const string aclTableName = "CUSTOM_ACL";
+        const string aclRuleName = "RULE_1";
+        const string policerName = "POLICER_1";
+        const string aclTablePorts = "Ethernet0";
+        const map<string, string> policerAttributes = {{"CIR", "1000"}, {"CBS", "200"}};
+        const string aclTableActions = "PACKET_ACTION,POLICER_ACTION";
+        const string aclTableMatch = "SRC_IP";
+        const string policer_action_attr = "POLICER_ACTION";
+
+        auto policerOrch = MockPolicerOrch(m_config_db.get());
+        auto aclOrch = MockAclOrch(m_config_db.get(), m_state_db.get(), gSwitchOrch, gPortsOrch, policerOrch.m_policerOrch, gMirrorOrch, gNeighOrch, gRouteOrch);
+
+        // Create ACL Table Type
+        aclOrch.doAclTableTypeTask({
+            {aclTableTypeName, SET_COMMAND, {{"type", "L3"}, {"matches", aclTableMatch}, {"actions", aclTableActions}}}
+        });
+
+        // Create ACL Table
+        aclOrch.doAclTableTask({
+            {aclTableName, SET_COMMAND, {{"type", aclTableTypeName}, {"ports", aclTablePorts}}}
+        });
+
+        // Create and validate Policer
+        policerOrch.createPolicer(policerName, policerAttributes);
+        ASSERT_TRUE(policerOrch.policerExists(policerName));
+
+        // Add ACL Rule with Policer Action
+        auto rule = make_shared<AclRulePolicer>(aclOrch.m_aclOrch, policerOrch.m_policerOrch, aclRuleName, aclTableName);
+        ASSERT_TRUE(rule->validateAddAction(policer_action_attr, policerName));
+        ASSERT_TRUE(aclOrch.m_aclOrch->addAclRule(rule, aclTableName));
+
+        // Validate Policer Ref Count
+        ASSERT_EQ(policerOrch.getPolicerRefCount(policerName), 1);
+
+        // Ensure that deleting a referenced policer is not allowed
+        policerOrch.deletePolicer(policerName);
+        ASSERT_TRUE(policerOrch.policerExists(policerName));
+        ASSERT_EQ(policerOrch.getPolicerRefCount(policerName), 1);
+
+        // Cleanup
+        ASSERT_TRUE(aclOrch.m_aclOrch->removeAclRule(aclTableName, aclRuleName));
+        policerOrch.deletePolicer(policerName);
+
+        // Validate Policer Removal
+        ASSERT_FALSE(policerOrch.policerExists(policerName));
+    }
+
 } // namespace nsAclOrchTest
