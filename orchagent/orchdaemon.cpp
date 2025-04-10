@@ -310,10 +310,10 @@ bool OrchDaemon::init()
     auto route_zmq_sever = enable_route_zmq ? m_zmqServer : nullptr;
 
     vector<string> ars_tables = {
-        CFG_ARS_PROFILE,                 
-        CFG_ARS_INTERFACE,               
-        CFG_ARS_OBJECT,               
-        CFG_ARS_NEXTHOP           
+        CFG_ARS_PROFILE_TABLE_NAME,                 
+        CFG_ARS_INTERFACE_TABLE_NAME,               
+        CFG_ARS_OBJECT_TABLE_NAME,               
+        CFG_ARS_NEXTHOP_TABLE_NAME           
     };
 
     gArsOrch = new ArsOrch(m_configDb, m_applDb, m_stateDb, ars_tables, vrf_orch);
@@ -878,9 +878,24 @@ void OrchDaemon::flush()
         handleSaiFailure(SAI_API_SWITCH, "set", status);
     }
 
-    for (auto* orch: m_orchList)
+    /*
+     * Don't flush if ringbuffer is enable and it is not empty or Idle. Ring buffer thread
+     * could trigger notification update.
+     *
+     * Flush would be triggered later after SELECT_TIMEOUT in main thread again
+     * for avoiding race condition.
+     */
+    if (gRingBuffer &&(!gRingBuffer->IsEmpty() || !gRingBuffer->IsIdle()))
     {
-        orch->flushResponses();
+        gRingBuffer->notify();
+        SWSS_LOG_WARN("Skip Flush waiting for RingBuffer empty");
+    }
+    else
+    {
+        for (auto* orch: m_orchList)
+        {
+            orch->flushResponses();
+        }
     }
 }
 

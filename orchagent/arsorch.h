@@ -14,40 +14,61 @@
 
 #include <map>
 
-#define ARS_NEXTHOP_GROUP_FLEX_COUNTER_GROUP    "ARS_NEXTHOP_GROUP_FLEX_STAT_COUNTER"
-#define ARS_LAG_FLEX_COUNTER_GROUP              "ARS_LAG_FLEX_STAT_COUNTER"
-#define ARS_STAT_FLEX_COUNTER_POLLING_INTERVAL_MS 10000
+#define ARS_OBJECT_DEFAULT_FLOWLET_IDLE_TIME_US     256
+#define ARS_OBJECT_DEFAULT_MAX_FLOWS                512
+#define ARS_OBJECT_DEFAULT_PRIMARY_PATH_THRESHOLD   16
+#define ARS_OBJECT_DEFAULT_ALTERNATIVE_PATH_COST    0
 
 enum ArsAssignMode
 {
     PER_FLOWLET_QUALITY,
-    PER_PACKET
+    PER_PACKET_QUALITY
+};
+
+typedef enum ArsAlgorithm
+{
+    ARS_ALGORITHM_EWMA
+} ArsAlgorithm;
+
+enum class ArsSelectorModeNhg
+{
+    ARS_SELECTOR_MODE_NHG_GLOBAL     = 0,
+    ARS_SELECTOR_MODE_NHG_INTERFACE  = 1,
+    ARS_SELECTOR_MODE_NHG_NEXTHOP    = 2,
+    ARS_SELECTOR_MODE_NHG_INVALID    = 3
+};
+
+enum class ArsSelectorModeLag
+{
+    ARS_SELECTOR_MODE_LAG_GLOBAL     = 0,
+    ARS_SELECTOR_MODE_LAG_INTERFACE  = 1,
+    ARS_SELECTOR_MODE_LAG_INVALID    = 2
 };
 
 typedef struct ArsObjectEntry
 {
-    std::string profile_name;                       // Name of ARS profile this object belong to
+    std::string ars_obj_name;
     ArsAssignMode assign_mode;                      // Stores an assign_mode from ArsAssignModes
     uint32_t flowlet_idle_time;                     // Flowlet idle time in micro seconds
     uint32_t max_flows;                             // Maximum number of flows in a flowlet
-    struct
-    {
-        uint32_t primary_threshold;                 // Primary path threshold
-    } quality_threshold;
-    std::set<NextHopGroupKey> nexthops;             // NHG that are configured to hw
-    std::set<string> lags;                          // ARS-enabled LAGs
     sai_object_id_t ars_object_id;                  // ARS Object ID if already created
+    uint32_t primary_path_threshold;                // Primary path threshold value
+    uint32_t alternative_path_cost;                 // Alternative path cost
 } ArsObjectEntry;
 
-typedef enum
+typedef struct ArsNexthopEntry
 {
-    ARS_ALGORITHM_EWMA
-} ArsAlgorithm;
+    std::string ars_obj_name;
+    std::string role;
+} ArsNexthopEntry;
 
 typedef struct ArsProfileEntry
 {
     string profile_name;                                    // Name of ARS profile configured by user
     ArsAlgorithm algorithm;                                 // ARS algorithm
+    ArsSelectorModeNhg nhg_selector_mode = ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INTERFACE;
+    ArsSelectorModeLag lag_selector_mode = ArsSelectorModeLag::ARS_SELECTOR_MODE_LAG_INTERFACE;
+    std::string default_ars_object;
     uint32_t max_flows;                                     // Maximum number of supported flows
     uint32_t sampling_interval;                             // Sampling interval in micro seconds
     struct
@@ -72,20 +93,19 @@ typedef struct ArsProfileEntry
 
     bool ipv4_enabled;                                      // Enable IPv4
     bool ipv6_enabled;                                      // Enable IPv6
+    uint32_t max_ecmp_groups;
+    uint32_t max_ecmp_members_per_group;
     uint32_t ref_count;                                     // Number of objects using this profile
     sai_object_id_t m_sai_ars_id;                           // SAI ARS profile OID
 } ArsProfileEntry;
 
 /* Map from IP prefix to ARS object */
-typedef std::map<IpPrefix, ArsObjectEntry> ArsNexthopGroupPrefixes; 
-typedef std::map<std::string, ArsNexthopGroupPrefixes> ArsPrefixesTables;
-/* Map from LAG name to ARS object */
-typedef std::map<std::string, ArsObjectEntry> ArsLags;
+typedef std::map<std::pair<std::string, IpAddress>, ArsNexthopEntry> ArsNexthops;
 /* Main structure to hold user configuration */
 typedef std::map<std::string, ArsProfileEntry> ArsProfiles;
 typedef std::map<std::string, ArsObjectEntry> ArsObjects;
 /* list of ARS-enabled Interfaces */
-typedef std::set<string> ArsEnabledInterfaces;             // ARS-Enabled interfaces for the profile
+typedef std::map<std::string, std::pair<std::uint32_t, std::string>> ArsEnabledInterfaces;  // ARS-Enabled interfaces for the profile
 
 typedef struct _ars_sai_attr_t
 {
@@ -108,145 +128,71 @@ class ArsOrch : public Orch, public Observer
 {
 public:
     ArsOrch(DBConnector *db, DBConnector *appDb, DBConnector *stateDb, vector<string> &tableNames, VRFOrch *vrfOrch);
-
-    bool isRouteArs(sai_object_id_t vrf_id, const IpPrefix &ipPrefix, sai_object_id_t * ars_object_id);
-    bool isLagArs(const std::string if_name, sai_object_id_t * ars_object_id);
-
+    ~ArsOrch() { deinit(); }
     // warm reboot support
     bool bake() override;
     void update(SubjectType type, void *cntx);
-
-    void generateLagCounterMap();
-    void generateNexthopGroupCounterMap();
-
+    bool isArsProfileEnabled() const;
+    bool validateNexthopsForArs(sai_object_id_t vrf_id, const NextHopGroupKey& nextHops, sai_object_id_t &ars_obj_id);
 protected:
     VRFOrch *m_vrfOrch;
-    std::shared_ptr<DBConnector> m_counter_db;
-    std::shared_ptr<DBConnector> m_asic_db;
-    std::unique_ptr<Table> m_lag_counter_table;
-    std::unique_ptr<Table> m_nhg_counter_table;
-    std::unique_ptr<Table> m_vidToRidTable;
-
-    SelectableTimer* m_LagFlexCounterUpdTimer = nullptr;
-    SelectableTimer* m_NhgFlexCounterUpdTimer = nullptr;
-
-    std::map<sai_object_id_t, std::string> m_pendingLagAddToFlexCntr;
-    std::map<sai_object_id_t, std::string> m_pendingNhgAddToFlexCntr;
 
 private:
     bool m_isArsSupported = false;
     ArsProfiles m_arsProfiles;
     ArsObjects m_arsObjects;
-    ArsPrefixesTables m_arsNexthopGroupPrefixes;
+    ArsNexthops m_arsNexthops;
     ArsEnabledInterfaces m_arsEnabledInterfaces;
-    ArsLags m_arsLags;
-    FlexCounterManager  m_lag_counter_manager;
-    FlexCounterManager  m_nhg_counter_manager;
     std::unique_ptr<Table> m_arsProfileStateTable;
     std::unique_ptr<Table> m_arsIfStateTable;
     std::unique_ptr<Table> m_arsNhgStateTable;
-    std::unique_ptr<Table> m_arsLagStateTable;
-    ars_sai_feature_lookup_t ars_features;
-    bool m_isLagCounterMapGenerated = false;
-    bool m_isNhgCounterMapGenerated = false;
-
+    std::unique_ptr<Table> m_arsCapabilityStateTable;
+    std::unique_ptr<Table> m_arsObjectStateTable;
+  
     bool setArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t> &ars_attrs);
     bool createArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t> &ars_attrs);
-    bool createArsObject(ArsObjectEntry *object, vector<sai_attribute_t> &ars_attrs);
-    bool setArsObject(ArsObjectEntry *object, vector<sai_attribute_t> &ars_attrs);    
+    bool setArsObject(ArsObjectEntry *object);    
+    bool createArsObject(ArsObjectEntry *object);
+    bool deleteArsProfile(ArsProfileEntry &profile);
+    std::vector<sai_attribute_t> buildArsAttributesFromObject(ArsObjectEntry *object);
     bool delArsObject(ArsObjectEntry *object);
-    bool updateArsEnabledInterface(const Port &port, const bool is_enable);
+    bool updateArsEnabledInterface(const Port &port, const uint32_t scaling_factor, const bool is_enable);
+
+    bool validatePortOrSubPorts(const std::string &alias, std::string &ars_object);
+
+    bool validateInterfaceModeArs(const std::set<NextHopKey> &nextHops, 
+                                  ArsSelectorModeNhg selector_mode, 
+                                  std::string &common_ars_obj);
+
+    ArsSelectorModeNhg getNhgSelectorMode() const;
+
+    bool isDefaultArsObjectValid(ArsSelectorModeNhg selector_mode, std::string &default_ars_object) const;
+
+    bool isPortArsCapable(const std::string &if_name, std::string &ars_object);
+
+    sai_object_id_t getArsObjectId(const std::string &ars_obj_name) const;
+
+    bool findDefaultArsObject(const ArsSelectorModeNhg &selector_mode, std::string &ars_obj_name);
 
     bool updateArsInterface(ArsProfileEntry &profile, const Port &port, const bool is_enable);
+    ArsSelectorModeNhg parseNhgSelectorMode(const std::string &modeStr) const;
+    ArsSelectorModeLag parseLagSelectorMode(const std::string &modeStr) const;
+    void createArsProfileSelectorMode(ArsProfileEntry &profile, ArsSelectorModeNhg new_nhg_mode, ArsSelectorModeNhg prev_nhg_mode);
+
+    void processArsInterfaces(bool enable, std::uint32_t scaling_factor);
+
     bool doTaskArsObject(Consumer &consumer);
     bool doTaskArsProfile(Consumer &consumer);
     bool doTaskArsInterfaces(Consumer &consumer);
-    bool doTaskArsNexthopGroup(Consumer &consumer);
-    bool doTaskArsLag(Consumer &consumer);
+    bool doTaskArsNexthop(Consumer &consumer);
     void doTask(Consumer& consumer);
-    void doTask(swss::SelectableTimer&) override;
 
-    bool isSetImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id)
-    {
-        auto feature = ars_features.find((uint32_t)object_type);
-        if (feature == ars_features.end())
-        {
-            return false;
-        }
-        auto attr = feature->second.attrs.find(attr_id);
-        if (attr == feature->second.attrs.end())
-        {
-            return false;
-        }
-        return attr->second.set_implemented;
-    }
-
-    bool isCreateImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id)
-    {
-        auto feature = ars_features.find((uint32_t)object_type);
-        if (feature == ars_features.end())
-        {
-            return false;
-        }
-        auto attr = feature->second.attrs.find(attr_id);
-        if (attr == feature->second.attrs.end())
-        {
-            return false;
-        }
-        return attr->second.create_implemented;
-    }
-
-    bool isGetImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id)
-    {
-        auto feature = ars_features.find((uint32_t)object_type);
-        if (feature == ars_features.end())
-        {
-            return false;
-        }
-        auto attr = feature->second.attrs.find(attr_id);
-        if (attr == feature->second.attrs.end())
-        {
-            return false;
-        }
-        return attr->second.get_implemented;
-    }
-
-    void initCapabilities()
-    {
-        SWSS_LOG_ENTER();
-
-        sai_attr_capability_t capability;
-        for (auto it = ars_features.begin(); it != ars_features.end(); it++)
-        {
-            for (auto it2 = it->second.attrs.begin(); it2 != it->second.attrs.end(); it2++)
-            {
-                if (sai_query_attribute_capability(gSwitchId, (sai_object_type_t)it->first,
-                                                    (sai_attr_id_t)it2->first,
-                                                    &capability) == SAI_STATUS_SUCCESS)
-                {
-                    SWSS_LOG_NOTICE("Feature %s Attr %s is supported. Create %s Set %s Get %s", it->second.name.c_str(), it2->second.attr_name.c_str(), capability.create_implemented ? "Y" : "N", capability.set_implemented ? "Y" : "N", capability.get_implemented ? "Y" : "N");
-                }
-                else
-                {
-                    SWSS_LOG_NOTICE("Feature %s Attr %s is NOT supported", it->second.name.c_str(), it2->second.attr_name.c_str());
-                }
-
-                it2->second.create_implemented = capability.create_implemented;
-                it2->second.set_implemented = capability.set_implemented;
-                it2->second.get_implemented = capability.get_implemented;
-            }
-        }
-
-        m_isArsSupported = isCreateImplemented(SAI_OBJECT_TYPE_SWITCH, SAI_SWITCH_ATTR_ARS_PROFILE);
-    }
-
-    void removeLagFromFlexCounter(sai_object_id_t id, const string &name);
-    void addLagToFlexCounter(sai_object_id_t oid, const string &name);
-    void addNhgToFlexCounter(sai_object_id_t oid, const IpPrefix &prefix, const string &vrf);
-    void removeNhgFromFlexCounter(sai_object_id_t id, const IpPrefix &prefix, const string &vrf);
-    std::unordered_set<std::string> generateLagCounterStats();
-    std::unordered_set<std::string> generateNhgCounterStats();
-
+    bool isSetImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id);
+    bool isCreateImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id);
+    bool isGetImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id);
+    void initCapabilities();
+    void deinit();
+    void deinitCapabilities();
 };
 
 #endif /* SWSS_ARSORCH_H */

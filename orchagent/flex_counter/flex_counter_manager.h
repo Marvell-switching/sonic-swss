@@ -39,18 +39,10 @@ enum class CounterType
     TUNNEL,
     HOSTIF_TRAP,
     ROUTE,
-<<<<<<< HEAD
     ENI,
     DASH_METER,
     SRV6,
     SWITCH,
-||||||| constructed merge base
-    ENI
-=======
-    ENI,
-    ARS_NEXTHOP_GROUP,
-    ARS_LAG
->>>>>>> Move to new branch
 };
 
 extern bool gTraditionalFlexCounter;

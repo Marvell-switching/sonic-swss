@@ -16,40 +16,12 @@ extern sai_object_id_t gSwitchId;
 extern sai_ars_profile_api_t*       sai_ars_profile_api;
 extern sai_ars_api_t*               sai_ars_api;
 extern sai_port_api_t*              sai_port_api;
-extern sai_lag_api_t*               sai_lag_api;
 extern sai_next_hop_group_api_t*    sai_next_hop_group_api;
-extern sai_route_api_t*             sai_route_api;
 extern sai_switch_api_t*            sai_switch_api;
 
-extern RouteOrch *gRouteOrch;
 extern PortsOrch *gPortsOrch;
-extern bool gTraditionalFlexCounter;
 
-static const map<string, sai_lag_attr_t> lag_counter_type_map = {
-    {"LAG_PACKETS_DROP", SAI_LAG_ATTR_ARS_PACKET_DROPS},
-    {"LAG_PORT_REASSIGNMENT", SAI_LAG_ATTR_ARS_PORT_REASSIGNMENTS}
-};
-
-static const map<string, sai_next_hop_group_attr_t> nhg_counter_type_map = {
-    {"NHG_PACKETS_DROP", SAI_NEXT_HOP_GROUP_ATTR_ARS_PACKET_DROPS},
-    {"NHG_MEMBER_REASSIGNMENT", SAI_NEXT_HOP_GROUP_ATTR_ARS_NEXT_HOP_REASSIGNMENTS},
-    {"NHG_PORT_REASSIGNMENT", SAI_NEXT_HOP_GROUP_ATTR_ARS_PORT_REASSIGNMENTS}
-};
-
-static const map<sai_lag_attr_t, string> lag_counter_stat_ids = {
-
-    {SAI_LAG_ATTR_ARS_PACKET_DROPS, "SAI_LAG_ATTR_ARS_PACKET_DROPS"},
-    {SAI_LAG_ATTR_ARS_PORT_REASSIGNMENTS, "SAI_LAG_ATTR_ARS_PORT_REASSIGNMENTS"}
-};
-
-static const map<sai_next_hop_group_attr_t, string> nhg_counter_stat_ids = {
-
-    {SAI_NEXT_HOP_GROUP_ATTR_ARS_PACKET_DROPS, "SAI_NEXT_HOP_GROUP_ATTR_ARS_PACKET_DROPS"},
-    {SAI_NEXT_HOP_GROUP_ATTR_ARS_NEXT_HOP_REASSIGNMENTS, "SAI_NEXT_HOP_GROUP_ATTR_ARS_NEXT_HOP_REASSIGNMENTS"},
-    {SAI_NEXT_HOP_GROUP_ATTR_ARS_PORT_REASSIGNMENTS, "SAI_NEXT_HOP_GROUP_ATTR_ARS_PORT_REASSIGNMENTS"}
-};
-
-ars_sai_attr_lookup_t ars_profile_attrs = {
+static ars_sai_attr_lookup_t ars_profile_attrs = {
     {SAI_ARS_PROFILE_ATTR_ALGO, {"SAI_ARS_PROFILE_ATTR_ALGO"}},
     {SAI_ARS_PROFILE_ATTR_SAMPLING_INTERVAL, {"SAI_ARS_PROFILE_ATTR_SAMPLING_INTERVAL"}},
     {SAI_ARS_PROFILE_ATTR_ARS_RANDOM_SEED, {"SAI_ARS_PROFILE_ATTR_ARS_RANDOM_SEED"}},
@@ -96,7 +68,7 @@ ars_sai_attr_lookup_t ars_profile_attrs = {
     {SAI_ARS_PROFILE_ATTR_QUANT_BAND_MAX_THRESHOLD_LIST_LOAD_CURRENT, {"SAI_ARS_PROFILE_ATTR_QUANT_BAND_MAX_THRESHOLD_LIST_LOAD_CURRENT"}},
     {SAI_ARS_PROFILE_ATTR_MAX_FLOWS, {"SAI_ARS_PROFILE_ATTR_MAX_FLOWS"}}
 };
-ars_sai_attr_lookup_t ars_sai_attrs = {
+static ars_sai_attr_lookup_t ars_obj_attrs = {
     {SAI_ARS_ATTR_MODE, {"SAI_ARS_ATTR_MODE"}},
     {SAI_ARS_ATTR_IDLE_TIME, {"SAI_ARS_ATTR_IDLE_TIME"}},
     {SAI_ARS_ATTR_MAX_FLOWS, {"SAI_ARS_ATTR_MAX_FLOWS"}},
@@ -108,55 +80,45 @@ ars_sai_attr_lookup_t ars_sai_attrs = {
     {SAI_ARS_ATTR_ALTERNATE_PATH_COST, {"SAI_ARS_ATTR_ALTERNATE_PATH_COST"}},
     {SAI_ARS_ATTR_ALTERNATE_PATH_BIAS, {"SAI_ARS_ATTR_ALTERNATE_PATH_BIAS"}}
 };
-ars_sai_attr_lookup_t ars_port_attrs = {
+static ars_sai_attr_lookup_t ars_port_attrs = {
     {SAI_PORT_ATTR_ARS_ENABLE, {"SAI_PORT_ATTR_ARS_ENABLE"}},
     {SAI_PORT_ATTR_ARS_PORT_LOAD_SCALING_FACTOR, {"SAI_PORT_ATTR_ARS_PORT_LOAD_SCALING_FACTOR"}},
     {SAI_PORT_ATTR_ARS_ALTERNATE_PATH, {"SAI_PORT_ATTR_ARS_ALTERNATE_PATH"}}
 };
 
-ars_sai_attr_lookup_t ars_nhg_attrs = {
+static ars_sai_attr_lookup_t ars_nhg_attrs = {
     {SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID, {"SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID"}},
     {SAI_NEXT_HOP_GROUP_ATTR_ARS_PACKET_DROPS, {"SAI_NEXT_HOP_GROUP_ATTR_ARS_PACKET_DROPS"}},
     {SAI_NEXT_HOP_GROUP_ATTR_ARS_NEXT_HOP_REASSIGNMENTS, {"SAI_NEXT_HOP_GROUP_ATTR_ARS_NEXT_HOP_REASSIGNMENTS"}},
     {SAI_NEXT_HOP_GROUP_ATTR_ARS_PORT_REASSIGNMENTS, {"SAI_NEXT_HOP_GROUP_ATTR_ARS_PORT_REASSIGNMENTS"}}
 };
 
-ars_sai_attr_lookup_t ars_switch_attrs = {
+static ars_sai_attr_lookup_t ars_switch_attrs = {
     {SAI_SWITCH_ATTR_ARS_PROFILE, {"SAI_SWITCH_ATTR_ARS_PROFILE"}}
 };
 
-ars_sai_attr_lookup_t ars_lag_attrs = {
-    {SAI_LAG_ATTR_ARS_OBJECT_ID, {"SAI_LAG_ATTR_ARS_OBJECT_ID"}},
-    {SAI_LAG_ATTR_ARS_PACKET_DROPS, {"SAI_LAG_ATTR_ARS_PACKET_DROPS"}},
-    {SAI_LAG_ATTR_ARS_PORT_REASSIGNMENTS, {"SAI_LAG_ATTR_ARS_PORT_REASSIGNMENTS"}}
-};
-
-ars_sai_feature_data_t ars_feature_switch_data =
+static ars_sai_feature_data_t ars_feature_switch_data =
     {"SAI_OBJECT_TYPE_SWITCH",ars_switch_attrs};
 
-ars_sai_feature_data_t ars_feature_profile_data =
+static ars_sai_feature_data_t ars_feature_profile_data =
     {"SAI_OBJECT_TYPE_ARS_PROFILE",ars_profile_attrs};
 
-ars_sai_feature_data_t ars_feature_ars_data =
-    {"SAI_OBJECT_TYPE_ARS",ars_sai_attrs};
+static ars_sai_feature_data_t ars_feature_obj_data =
+    {"SAI_OBJECT_TYPE_ARS",ars_obj_attrs};
 
-ars_sai_feature_data_t ars_feature_port_data =
+static ars_sai_feature_data_t ars_feature_port_data =
     {"SAI_OBJECT_TYPE_PORT",ars_port_attrs};
 
-ars_sai_feature_data_t ars_feature_nhg_data =
+static ars_sai_feature_data_t ars_feature_nhg_data =
     {"SAI_OBJECT_TYPE_NEXT_HOP_GROUP",ars_nhg_attrs};
 
-ars_sai_feature_data_t ars_feature_lag_data =
-    {"SAI_OBJECT_TYPE_LAG",ars_lag_attrs};
-
-ars_sai_feature_lookup_t ars_features =
+static ars_sai_feature_lookup_t ars_features =
 {
     {SAI_OBJECT_TYPE_SWITCH, ars_feature_switch_data},
     {SAI_OBJECT_TYPE_ARS_PROFILE, ars_feature_profile_data},
-    {SAI_OBJECT_TYPE_ARS, ars_feature_ars_data},
+    {SAI_OBJECT_TYPE_ARS, ars_feature_obj_data},
     {SAI_OBJECT_TYPE_PORT, ars_feature_port_data},
     {SAI_OBJECT_TYPE_NEXT_HOP_GROUP, ars_feature_nhg_data},
-    {SAI_OBJECT_TYPE_LAG, ars_feature_lag_data}
 };
 
 #define ARS_FIELD_NAME_MAX_FLOWS              "max_flows"
@@ -179,29 +141,30 @@ ars_sai_feature_lookup_t ars_features =
 #define ARS_FIELD_NAME_IPV4_ENABLE            "ipv4_enable"
 #define ARS_FIELD_NAME_IPV6_ENABLE            "ipv6_enable"
 
-#define ARS_FIELD_NAME_PROFILE_NAME "profile_name"
-#define ARS_FIELD_NAME_ARS_NAME "ars_name"
-#define ARS_FIELD_NAME_ASSIGN_MODE "assign_mode"
-#define ARS_FIELD_NAME_PER_FLOWLET "per_flowlet_quality"
-#define ARS_FIELD_NAME_PER_PACKET "per_packet"
-#define ARS_FIELD_NAME_IDLE_TIME "flowlet_idle_time"
-#define ARS_FIELD_NAME_QUALITY_THRESHOLD "quality_threshold"
-#define ARS_FIELD_NAME_PRIMARY_PATH_THRESHOLD "primary_path_threshold"
+#define ARS_FIELD_NAME_PROFILE_NAME           "profile_name"
+#define ARS_FIELD_NAME_ARS_OBJ_NAME           "ars_obj_name"
+#define ARS_FIELD_NAME_ASSIGN_MODE            "assign_mode"
+#define ARS_FIELD_NAME_PER_FLOWLET            "per_flowlet_quality"
+#define ARS_FIELD_NAME_PER_PACKET             "per_packet_quality"
+#define ARS_FIELD_NAME_IDLE_TIME              "flowlet_idle_time"
+#define ARS_FIELD_NAME_OBJ_MAX_FLOWS          "max_flows"
+#define ARS_FIELD_NAME_QUALITY_THRESHOLD      "quality_threshold"
+#define ARS_FIELD_NAME_SCALING_FACTOR         "scaling_factor"
+#define ARS_FIELD_NAME_PRIMARY_PATH_THRESHOLD  "primary_path_threshold"
+#define ARS_FIELD_NAME_ALTERNATIVE_PATH_COST   "alternative_path_cost"
+
+
+#define ARS_FIELD_NAME_NHG_PATH_SELECTOR_MODE  "ars_nhg_path_selector_mode"
+#define ARS_FIELD_NAME_LAG_PATH_SELECTOR_MODE  "ars_lag_path_selector_mode"
+#define ARS_FIELD_NAME_DEFAULT_OBJECT          "default_ars_object"
+#define ARS_FIELD_NAME_OBJECT_NAME             "ars_obj_name"
+#define ARS_FIELD_NAME_ROLE                    "role"
 
 ArsOrch::ArsOrch(DBConnector *config_db, DBConnector *appDb, DBConnector *stateDb, vector<string> &tableNames, VRFOrch *vrfOrch) :
         Orch(config_db, tableNames),
         m_vrfOrch(vrfOrch),
-        m_counter_db(std::shared_ptr<DBConnector>(new DBConnector("COUNTERS_DB", 0))),
-        m_asic_db(std::shared_ptr<DBConnector>(new DBConnector("ASIC_DB", 0))),
-        m_lag_counter_table(std::unique_ptr<Table>(new Table(m_counter_db.get(), COUNTERS_ARS_LAG_NAME_MAP))),
-        m_nhg_counter_table(std::unique_ptr<Table>(new Table(m_counter_db.get(), COUNTERS_ARS_NEXTHOP_GROUP_NAME_MAP))),
-        m_vidToRidTable(std::unique_ptr<Table>(new Table(m_asic_db.get(), "VIDTORID"))),
-        m_lag_counter_manager(ARS_LAG_FLEX_COUNTER_GROUP, StatsMode::READ, ARS_STAT_FLEX_COUNTER_POLLING_INTERVAL_MS, false),
-        m_nhg_counter_manager(ARS_NEXTHOP_GROUP_FLEX_COUNTER_GROUP, StatsMode::READ, ARS_STAT_FLEX_COUNTER_POLLING_INTERVAL_MS, false),
         m_arsProfileStateTable(std::unique_ptr<Table>(new Table(stateDb, STATE_ARS_PROFILE_TABLE_NAME))),
-        m_arsIfStateTable(std::unique_ptr<Table>(new Table(stateDb, STATE_ARS_INTERFACE_TABLE_NAME))),
-        m_arsNhgStateTable(std::unique_ptr<Table>(new Table(stateDb, STATE_ARS_NEXTHOP_GROUP_TABLE_NAME))),
-        m_arsLagStateTable(std::unique_ptr<Table>(new Table(stateDb, STATE_ARS_LAG_TABLE_NAME)))
+        m_arsCapabilityStateTable(std::unique_ptr<Table>(new Table(stateDb, STATE_ARS_CAPABILITY_TABLE_NAME)))
 {
     SWSS_LOG_ENTER();
 
@@ -210,24 +173,126 @@ ArsOrch::ArsOrch(DBConnector *config_db, DBConnector *appDb, DBConnector *stateD
     if (m_isArsSupported)
     {
         gPortsOrch->attach(this);
+    }
+}
 
-        auto intervT = timespec { .tv_sec = 1 , .tv_nsec = 0 };
 
-        if (isGetImplemented(SAI_OBJECT_TYPE_LAG, SAI_LAG_ATTR_ARS_PACKET_DROPS) || isGetImplemented(SAI_OBJECT_TYPE_LAG, SAI_LAG_ATTR_ARS_PORT_REASSIGNMENTS))
+bool ArsOrch::isSetImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id)
+{
+    auto feature = ars_features.find((uint32_t)object_type);
+    if (feature == ars_features.end())
+    {
+        return false;
+    }
+    auto attr = feature->second.attrs.find(attr_id);
+    if (attr == feature->second.attrs.end())
+    {
+        return false;
+    }
+    return attr->second.set_implemented;
+}
+
+bool ArsOrch::isCreateImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id)
+{
+    auto feature = ars_features.find((uint32_t)object_type);
+    if (feature == ars_features.end())
+    {
+        return false;
+    }
+    auto attr = feature->second.attrs.find(attr_id);
+    if (attr == feature->second.attrs.end())
+    {
+        return false;
+    }
+    return attr->second.create_implemented;
+}
+
+bool ArsOrch::isGetImplemented(sai_object_type_t object_type, sai_attr_id_t attr_id)
+{
+    auto feature = ars_features.find((uint32_t)object_type);
+    if (feature == ars_features.end())
+    {
+        return false;
+    }
+    auto attr = feature->second.attrs.find(attr_id);
+    if (attr == feature->second.attrs.end())
+    {
+        return false;
+    }
+    return attr->second.get_implemented;
+}
+
+void ArsOrch::initCapabilities()
+{
+    SWSS_LOG_ENTER();
+
+    sai_attr_capability_t capability;
+
+    for (auto it = ars_features.begin(); it != ars_features.end(); it++)
+    {
+        for (auto it2 = it->second.attrs.begin(); it2 != it->second.attrs.end(); it2++)
         {
-            m_LagFlexCounterUpdTimer = new SelectableTimer(intervT);
-            auto executorT = new ExecutableTimer(m_LagFlexCounterUpdTimer, this, "ARS_LAG_FLEX_COUNTER_UPD_TIMER");
-            Orch::addExecutor(executorT);
-        }
-        if (isGetImplemented(SAI_OBJECT_TYPE_NEXT_HOP_GROUP, SAI_NEXT_HOP_GROUP_ATTR_ARS_PACKET_DROPS) || 
-            isGetImplemented(SAI_OBJECT_TYPE_NEXT_HOP_GROUP, SAI_NEXT_HOP_GROUP_ATTR_ARS_NEXT_HOP_REASSIGNMENTS) || 
-            isGetImplemented(SAI_OBJECT_TYPE_NEXT_HOP_GROUP, SAI_NEXT_HOP_GROUP_ATTR_ARS_PORT_REASSIGNMENTS))
-        {
-            m_NhgFlexCounterUpdTimer = new SelectableTimer(intervT);
-            auto executorT = new ExecutableTimer(m_NhgFlexCounterUpdTimer, this, "ARS_NHG_FLEX_COUNTER_UPD_TIMER");
-            Orch::addExecutor(executorT);
+            if (sai_query_attribute_capability(gSwitchId, (sai_object_type_t)it->first,
+                                                    (sai_attr_id_t)it2->first,
+                                                    &capability) == SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_NOTICE("Feature %s Attr %s is supported. Create %s Set %s Get %s", it->second.name.c_str(), it2->second.attr_name.c_str(), capability.create_implemented ? "Y" : "N", capability.set_implemented ? "Y" : "N", capability.get_implemented ? "Y" : "N");
+            }
+            else
+            {
+                SWSS_LOG_NOTICE("Feature %s Attr %s is NOT supported", it->second.name.c_str(), it2->second.attr_name.c_str());
+            }
+
+            it2->second.create_implemented = capability.create_implemented;
+            it2->second.set_implemented = capability.set_implemented;
+            it2->second.get_implemented = capability.get_implemented;
+
+            vector<FieldValueTuple> fieldValues;
+            fieldValues.emplace_back("create", capability.create_implemented ? "true" : "false");
+            fieldValues.emplace_back("set", capability.set_implemented ? "true" : "false");
+            fieldValues.emplace_back("get", capability.get_implemented ? "true" : "false");
+            m_arsCapabilityStateTable->set(it->second.name + "|" + it2->second.attr_name, fieldValues);
         }
     }
+
+    m_isArsSupported = isCreateImplemented(SAI_OBJECT_TYPE_SWITCH, SAI_SWITCH_ATTR_ARS_PROFILE);
+}
+
+void ArsOrch::deinitCapabilities()
+{
+    SWSS_LOG_ENTER();
+
+    // Clear out ARS capability state entries
+    if (m_arsCapabilityStateTable)
+    {
+        for (auto &feature : ars_features)
+        {
+            for (auto &attr : feature.second.attrs)
+            {
+                std::string key = feature.second.name + "|" + attr.second.attr_name;
+                m_arsCapabilityStateTable->del(key);
+            }
+        }
+    }
+
+    // Reset internal flags and structures
+    m_isArsSupported = false;
+
+    SWSS_LOG_NOTICE("ArsOrch capabilities deinitialized");
+}
+
+void ArsOrch::deinit()
+{
+    SWSS_LOG_ENTER();
+
+    if (m_isArsSupported && gPortsOrch)
+    {
+        gPortsOrch->detach(this);
+    }
+
+    deinitCapabilities();
+
+    SWSS_LOG_NOTICE("ArsOrch deinitialized");
 }
 
 void ArsOrch::update(SubjectType type, void *cntx)
@@ -237,16 +302,18 @@ void ArsOrch::update(SubjectType type, void *cntx)
 
     if (m_arsProfiles.empty())
     {
-        SWSS_LOG_INFO("ARS not enabled - no action on interface or nexthop state change");
+        SWSS_LOG_INFO("ARS not enabled - no action on interface state change");
         return;
     }
 
     switch(type) {
         case SUBJECT_TYPE_PORT_OPER_STATE_CHANGE:
         {
-            /* confgiure port scaling factor when port speed becomes available */
+            /* configure port scaling factor when port speed becomes available */
             PortOperStateUpdate *update = reinterpret_cast<PortOperStateUpdate *>(cntx);
-            bool is_found = (m_arsEnabledInterfaces.find(update->port.m_alias) != m_arsEnabledInterfaces.end());
+            SWSS_LOG_NOTICE("ARS port notification - port %s state %s", update->port.m_alias.c_str(), update->operStatus == SAI_PORT_OPER_STATUS_UP ? "enable" : "disable");
+            auto ars_if = m_arsEnabledInterfaces.find(update->port.m_alias);
+            bool is_found = (ars_if != m_arsEnabledInterfaces.end());
             if (is_found)
             {
                 SWSS_LOG_INFO("Interface %s %senabled for ARS - %s ARS",
@@ -255,134 +322,329 @@ void ArsOrch::update(SubjectType type, void *cntx)
                         update->operStatus == SAI_PORT_OPER_STATUS_UP ? "enable" : "disable");
                 if (update->operStatus == SAI_PORT_OPER_STATUS_UP)
                 {
-                    updateArsEnabledInterface(update->port, true);
+                    updateArsEnabledInterface(update->port, ars_if->second.first, true);
                 }
-            }
-            break;
-        }
-        case SUBJECT_TYPE_PORT_CHANGE:
-        {
-            /* configure port and lag ARS enable */
-            bool is_lag = false;
-            PortUpdate *update = reinterpret_cast<PortUpdate *>(cntx);
-            if (update->port.m_lag_id && m_arsLags.find(update->port.m_alias) != m_arsLags.end())
-            {
-                is_lag = true;
-                if (!update->add)
-                {
-                    /* remove from counter db */                    
-                    removeLagFromFlexCounter(update->port.m_lag_id, update->port.m_alias);
-                }
-                break;
-            }
-
-            bool is_found = (m_arsEnabledInterfaces.find(update->port.m_alias) != m_arsEnabledInterfaces.end());
-            SWSS_LOG_INFO("Interface %s is %s - %s",
-                    update->port.m_alias.c_str(),
-                    update->add ? "added" : "deleted",
-                    is_found ? "enable ARS" : "ignore");
-            if (is_found && !is_lag)
-            {
-                if (update->port.m_oper_status == SAI_PORT_OPER_STATUS_UP)
-                {
-                    updateArsEnabledInterface(update->port, true);
-                }
-            }
-
-            /* check if this is lag or member of lag */
-            if (is_lag)
-            {
-                Port lag;
-                if (gPortsOrch->getPort(update->port.m_lag_id, lag))
-                {
-                    auto lag_object = m_arsLags.find(update->port.m_alias);
-                    sai_attribute_t attr;
-                    attr.id = SAI_LAG_ATTR_ARS_OBJECT_ID;
-
-                    /* check if ars object id needs updating or should  be removed */
-                    if (isSetImplemented(SAI_OBJECT_TYPE_LAG, SAI_LAG_ATTR_ARS_OBJECT_ID))
-                    {
-                        if (isGetImplemented(SAI_OBJECT_TYPE_LAG, SAI_LAG_ATTR_ARS_OBJECT_ID))
-                        {
-
-                            sai_status_t status = sai_lag_api->get_lag_attribute(update->port.m_lag_id, 1, &attr);
-                            if (status != SAI_STATUS_SUCCESS)
-                            {
-                                SWSS_LOG_ERROR("Failed to get ars id of lag: %s", update->port.m_alias.c_str());
-                            }
-                        }
-
-                        if (attr.value.oid != lag_object->second.ars_object_id)
-                        {
-                            attr.value.oid = lag_object->second.ars_object_id;
-                            sai_status_t status = sai_lag_api->set_lag_attribute(update->port.m_lag_id, &attr);
-                            if (status != SAI_STATUS_SUCCESS)
-                            {
-                                SWSS_LOG_ERROR("Failed to set poid %" PRIx64 " to lag: %s", attr.value.oid, update->port.m_alias.c_str());
-                            }
-                            addLagToFlexCounter(update->port.m_lag_id, update->port.m_alias);
-                        }
-                    }
-                }
-            }
-            break;
-        }
-        case SUBJECT_TYPE_NEXTHOP_CHANGE:
-        {
-            NextHopUpdate *update = reinterpret_cast<NextHopUpdate *>(cntx);
-            /* verify that it is a ARS NHG */
-            std::string vrf_name;
-            if (update->vrf_id == gVirtualRouterId)
-            {
-                vrf_name = "default";
-            }
-            else
-            {
-                vrf_name = m_vrfOrch->getVRFname(update->vrf_id);
-            }
-            if (vrf_name == "")
-            {
-                break;
-            }
-            auto nhg_table = m_arsNexthopGroupPrefixes.find(vrf_name);
-            if (nhg_table == m_arsNexthopGroupPrefixes.end())
-            {
-                break;
-            }
-            auto ars_object = nhg_table->second.find(update->prefix);
-            if (ars_object == nhg_table->second.end())
-            {
-                break;
-            }
-            /* don't rely on reported nhg - use cached info */
-            auto nhg_sai_id = gRouteOrch->getNextHopGroupId(update->nexthopGroup);
-            if (nhg_sai_id == SAI_NULL_OBJECT_ID)
-            {
-                break;
-            }
-            /* if NHG is not yet configured */
-            if (update->nexthopGroup.getSize() > 1 && ars_object->second.nexthops.find(update->nexthopGroup) == ars_object->second.nexthops.end())
-            {
-                if (!isSetImplemented(SAI_OBJECT_TYPE_NEXT_HOP_GROUP, SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID))
-                {
-                    SWSS_LOG_NOTICE("Remove existing NHG and create ARS-enabled");
-                    if (gRouteOrch->reconfigureNexthopGroupWithArsState(update->nexthopGroup, nhg_sai_id, ars_object->second.ars_object_id))
-                    {
-                        addNhgToFlexCounter(nhg_sai_id, update->prefix, vrf_name);
-                    }
-                }
-                /* just update the NHG attr */
-                else if (gRouteOrch->updateNexthopGroupArsState(nhg_sai_id, ars_object->second.ars_object_id))
-                {
-                    addNhgToFlexCounter(nhg_sai_id, update->prefix, vrf_name);
-                }
-                ars_object->second.nexthops.insert(update->nexthopGroup);
             }
             break;
         }
         default:
             break;
     }
+}
+
+bool ArsOrch::validateNexthopsForArs(sai_object_id_t vrf_id, const NextHopGroupKey &nextHops, sai_object_id_t &ars_obj_id) 
+{
+    SWSS_LOG_ENTER();
+
+    std::string common_ars_obj;
+    std::string common_ars_obj_nh;
+    std::string ars_obj_nh;
+    bool is_ars_capable_nhg = false;
+    ArsSelectorModeNhg selector_mode = getNhgSelectorMode();
+    if (selector_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INVALID)
+    {
+        SWSS_LOG_DEBUG("Invalid ARS NHG selector mode — cannot validate nexthops");
+        return false;
+    }
+
+    // --------------------------------------------------
+    // 1. GLOBAL MODE
+    // --------------------------------------------------
+    if (selector_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_GLOBAL)
+    {
+        if (!isDefaultArsObjectValid(selector_mode, common_ars_obj))
+        {
+            SWSS_LOG_DEBUG("Default ars object is not configured for GLOBAL mode");
+            return false;
+        }
+        /* Need to fill sai object */
+        is_ars_capable_nhg = true;
+    }
+
+    auto &nhk_map = nextHops.getNextHops();
+    if (nhk_map.empty())
+    {
+        SWSS_LOG_DEBUG("No nexthops found for VRF %lu in ARS validation", vrf_id);
+        return false;
+    }
+
+    // --------------------------------------------------
+    // 2. INTERFACE MODE
+    // --------------------------------------------------
+    if (selector_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INTERFACE)
+    {
+        bool allArsCapable = validateInterfaceModeArs(nextHops.getNextHops(), selector_mode, common_ars_obj);
+        if (allArsCapable)
+        {
+            SWSS_LOG_NOTICE("All INTERFACE-mode nexthop interfaces are ARS capable");
+            is_ars_capable_nhg = true;
+        }
+        else
+        {
+            SWSS_LOG_NOTICE("Some INTERFACE-mode nexthop interfaces are NOT ARS capable");
+            return false;
+        }
+    }
+
+    // --------------------------------------------------
+    // 3. NEXTHOP MODE
+    // --------------------------------------------------
+    if (selector_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_NEXTHOP)
+    {
+        for (const auto &nh: nhk_map)
+        {
+            std::string nexthop_ip = nh.ip_address.to_string();
+            std::string alias = nh.alias; /* interface name (EthernetX, PortChannelX, etc.) */
+            std::string vrf_name;
+            vrf_name = m_vrfOrch->getVRFname(vrf_id); 
+            auto nexthop_key = std::make_pair(vrf_name, nexthop_ip);
+            auto nexthopIt = m_arsNexthops.find(nexthop_key);
+            if (nexthopIt == m_arsNexthops.end())
+            {
+                SWSS_LOG_NOTICE("ARS nexthop entry not found for VRF %s and nexthop %s",
+                    vrf_name.c_str(), nexthop_ip.c_str());
+                return false;
+            }
+            const ArsNexthopEntry &ars_entry = nexthopIt->second;
+            ars_obj_nh = ars_entry.ars_obj_name;
+            if (common_ars_obj_nh.empty())
+            {
+                common_ars_obj_nh = ars_obj_nh;
+            }
+            else if (ars_obj_nh != common_ars_obj_nh)
+            {
+                SWSS_LOG_NOTICE("Nexthop %s has ARS object %s, differs from others (%s)",
+                             nexthop_ip.c_str(), ars_obj_nh.c_str(), common_ars_obj_nh.c_str());
+                return false;
+            }
+        }
+        bool allArsCapable = validateInterfaceModeArs(nextHops.getNextHops(), selector_mode, common_ars_obj);
+        if (allArsCapable)
+        {
+            SWSS_LOG_NOTICE("All nextop-mode nexthop interfaces are ARS capable");
+            common_ars_obj = ars_obj_nh;
+            is_ars_capable_nhg = true;
+        }
+    }
+    if (is_ars_capable_nhg)
+    {
+        ars_obj_id = getArsObjectId(common_ars_obj);
+        return true;
+    }
+    return false;
+}
+
+bool ArsOrch::validatePortOrSubPorts(const std::string &alias, std::string &ars_object)
+{
+    SWSS_LOG_ENTER();
+    Port port;
+    if (!gPortsOrch->getPort(alias, port))
+    {
+        SWSS_LOG_NOTICE("Port %s not found", alias.c_str());
+        return false;
+    }
+
+    switch (port.m_type)
+    {
+        case Port::LAG:
+            if (port.m_members.empty())
+            {
+                SWSS_LOG_NOTICE("PortChannel %s has no members", alias.c_str());
+                return false;
+            }
+            for (const auto &member : port.m_members)
+            {
+                if (!validatePortOrSubPorts(member, ars_object))
+                    return false;
+            }
+            return true;
+
+        default:
+            /* Physical port or sub-interface */
+            std::string checkAlias = alias;
+            auto dotPos = alias.find('.');
+            if (dotPos != std::string::npos)
+                checkAlias = alias.substr(0, dotPos);
+
+            if (!isPortArsCapable(checkAlias, ars_object))
+            {
+                SWSS_LOG_NOTICE("Port %s is not ARS capable", checkAlias.c_str());
+                return false;
+            }
+            return true;
+    }
+}
+
+bool ArsOrch::validateInterfaceModeArs(const std::set<NextHopKey> &nextHops, ArsSelectorModeNhg selector_mode, std::string &common_ars_obj)
+{
+    SWSS_LOG_ENTER();
+
+    std::set<std::string> nh_member_list;
+    bool first_iface = true;
+    std::string ars_obj;
+    Port port;
+    // Step 1: collect unique interfaces from nexthops
+    for (const auto &nh : nextHops)
+    {
+        if (!nh.alias.empty())
+            nh_member_list.insert(nh.alias); //nhMemberList
+    }
+
+    // Step 2: validate each interface
+    for (const auto &alias : nh_member_list)
+    {
+        if (!gPortsOrch->getPort(alias, port))
+        {
+            SWSS_LOG_NOTICE("Interface %s not found", alias.c_str());
+            return false;
+        }
+
+        switch (port.m_type)
+        {
+            case Port::VLAN:
+                if (port.m_members.empty())
+                {
+                    SWSS_LOG_NOTICE("VLAN %s has no member ports", alias.c_str());
+                    return false;
+                }
+                for (const auto &member : port.m_members)
+                {
+                    if (!validatePortOrSubPorts(member, ars_obj))
+                    {
+                        SWSS_LOG_NOTICE("Underlying port %s under VLAN %s is not ARS capable",
+                                        member.c_str(), alias.c_str());
+                        return false;
+                    }
+                    // Ensure ARS object consistency across all interfaces
+                    
+                    if (selector_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INTERFACE)
+                    {
+                        if (first_iface)
+                        {
+                            common_ars_obj = ars_obj;
+                            first_iface = false;
+                        }
+                        else if (ars_obj != common_ars_obj)
+                        {
+                            SWSS_LOG_NOTICE("Interface %s has ARS object %s (expected %s)", 
+                                alias.c_str(), ars_obj.c_str(), common_ars_obj.c_str());
+                            return false;
+                        }
+                    }
+                }
+                break;
+
+            default:
+                /* Physical port, sub-interface, or PortChannel */
+                if (!validatePortOrSubPorts(alias, ars_obj)) {
+                    SWSS_LOG_NOTICE("ARS is not capable for interface '%s' with ARS object '%s'",
+                       alias.c_str(), ars_obj.c_str());
+                    return false;
+                 }
+                /* Ensure ARS object consistency across all interfaces */
+                if (selector_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INTERFACE)
+                {
+                    if (first_iface)
+                    {
+                            common_ars_obj = ars_obj;
+                            first_iface = false;
+                    }
+                   else if (ars_obj != common_ars_obj)
+                   {
+                       SWSS_LOG_NOTICE("Interface %s has ARS object %s (expected %s)", 
+                           alias.c_str(), ars_obj.c_str(), common_ars_obj.c_str());
+                       return false;
+                   }
+                }
+                break;
+        }
+        default:
+            break;
+    }
+
+    SWSS_LOG_DEBUG("All interfaces are ARS capable");
+    return true;
+}
+
+ArsSelectorModeNhg ArsOrch::getNhgSelectorMode() const
+{
+    SWSS_LOG_ENTER();
+    if (m_arsProfiles.empty())
+    {
+        SWSS_LOG_NOTICE("No ARS profile found in m_arsProfiles");
+        return ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INVALID;
+    }
+
+    const ArsProfileEntry& profile = m_arsProfiles.begin()->second;
+
+    // Sanity check in case mode is invalid or uninitialized
+    if (profile.nhg_selector_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INVALID)
+    {
+        SWSS_LOG_NOTICE("ARS profile has invalid NHG selector mode");
+        return ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INVALID;
+    }
+
+    return profile.nhg_selector_mode;
+}
+
+bool ArsOrch::isDefaultArsObjectValid(ArsSelectorModeNhg selector_mode, std::string &default_ars_object) const
+{
+    SWSS_LOG_ENTER();
+
+    /* Only GLOBAL mode requires a default ARS object */
+    if (selector_mode != ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_GLOBAL)
+    {
+        return false;
+    }
+
+    if (m_arsProfiles.empty())
+    {
+        SWSS_LOG_ERROR("No ARS profile available");
+        return false;
+    }
+
+    const ArsProfileEntry &profile = m_arsProfiles.begin()->second;
+
+    if (profile.default_ars_object.empty())
+    {
+        SWSS_LOG_ERROR("Default ARS object is missing for GLOBAL mode");
+        return false;
+    }
+
+    default_ars_object = profile.default_ars_object;
+
+    SWSS_LOG_DEBUG("Default ARS object validated for GLOBAL mode: %s",
+                   default_ars_object.c_str());
+    return true;
+}
+
+
+bool ArsOrch::isPortArsCapable(const std::string &if_name, std::string &ars_object)
+{
+    SWSS_LOG_ENTER();
+    auto it = m_arsEnabledInterfaces.find(if_name);
+    if (it == m_arsEnabledInterfaces.end())
+    {
+        SWSS_LOG_DEBUG("Interface %s is not ARS enabled", if_name.c_str());
+        return false;
+    }
+
+    ars_object = it->second.second; // ARS object
+    SWSS_LOG_DEBUG("Interface %s is ARS enabled with ARS object %s", if_name.c_str(), ars_object.c_str());
+    return true;
+}
+
+sai_object_id_t ArsOrch::getArsObjectId(const std::string &ars_obj_name) const
+{
+    SWSS_LOG_ENTER();
+    auto it = m_arsObjects.find(ars_obj_name);
+    if (it == m_arsObjects.end())
+    {
+        SWSS_LOG_NOTICE("ARS object %s not found", ars_obj_name.c_str());
+        return SAI_NULL_OBJECT_ID;
+    }
+
+    return it->second.ars_object_id;
 }
 
 bool ArsOrch::bake()
@@ -395,9 +657,22 @@ bool ArsOrch::bake()
         return true;
     }
 
-    SWSS_LOG_NOTICE("Warm reboot: placeholder");
-
     return Orch::bake();
+}
+
+
+bool ArsOrch::isArsProfileEnabled () const
+{
+    SWSS_LOG_ENTER();
+
+    if (!m_arsProfiles.empty())
+    {
+        SWSS_LOG_INFO("ARS profiles exist.");
+        return true;
+    }
+
+    SWSS_LOG_INFO("No ARS profiles configured in m_arsProfiles");
+    return false;
 }
 
 bool ArsOrch::createArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t> &ars_attrs)
@@ -408,25 +683,25 @@ bool ArsOrch::createArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t>
     vector<sai_attribute_t> supported_ars_attrs;
 
     /* go over set of attr and set only supported attributes  */
-    for (auto a : ars_attrs)
+    for (auto attr : ars_attrs)
     {
-        if (isCreateImplemented(SAI_OBJECT_TYPE_ARS_PROFILE, a.id))
+        if (isCreateImplemented(SAI_OBJECT_TYPE_ARS_PROFILE, attr.id))
         {
-            supported_ars_attrs.push_back(a);
+            supported_ars_attrs.push_back(attr);
             SWSS_LOG_NOTICE("ARS profile %s. Setting Attr %d value %u",
-                             profile.profile_name.c_str(), a.id, a.value.u32);
+                             profile.profile_name.c_str(), attr.id, attr.value.u32);
         }
         else
         {
-            if (a.id == SAI_ARS_PROFILE_ATTR_ENABLE_IPV4 || a.id == SAI_ARS_PROFILE_ATTR_ENABLE_IPV6)
+            if (attr.id == SAI_ARS_PROFILE_ATTR_ENABLE_IPV4 || attr.id == SAI_ARS_PROFILE_ATTR_ENABLE_IPV6)
             {
                 SWSS_LOG_WARN("Setting Attr %d is not supported. Failed to set ARS profile %s value %s",
-                               a.id, profile.profile_name.c_str(), a.value.booldata ? "true" : "false");
+                               attr.id, profile.profile_name.c_str(), attr.value.booldata ? "true" : "false");
             }
             else
             {
                 SWSS_LOG_WARN("Setting Attr %d is not supported. Failed to set ARS profile %s value %u",
-                               a.id, profile.profile_name.c_str(), a.value.u32);
+                               attr.id, profile.profile_name.c_str(), attr.value.u32);
             }
             continue;
         }
@@ -452,7 +727,51 @@ bool ArsOrch::createArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t>
         }
     }
 
-    SWSS_LOG_NOTICE("Created ARS profile %s (oid %" PRIx64 ")", profile.profile_name.c_str(), profile.m_sai_ars_id);
+    // update read-only attributes
+    sai_attribute_t attr;
+    if (isGetImplemented(SAI_OBJECT_TYPE_ARS_PROFILE, SAI_ARS_PROFILE_ATTR_ECMP_ARS_MAX_GROUPS))
+    {
+        attr.id = SAI_ARS_PROFILE_ATTR_ECMP_ARS_MAX_GROUPS;
+        status = sai_ars_profile_api->get_ars_profile_attribute(profile.m_sai_ars_id, 1, &attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("Failed to get ars profile %s (oid 0x%" PRIx64 ") attr SAI_ARS_PROFILE_ATTR_ECMP_ARS_MAX_GROUPS: %d",
+                profile.profile_name.c_str(), profile.m_sai_ars_id, status);
+            attr.value.u32 = 0;
+        }
+    }
+    profile.max_ecmp_groups = attr.value.u32;
+
+    if (isGetImplemented(SAI_OBJECT_TYPE_ARS_PROFILE, SAI_ARS_PROFILE_ATTR_ECMP_ARS_MAX_MEMBERS_PER_GROUP))
+    {
+        attr.id = SAI_ARS_PROFILE_ATTR_ECMP_ARS_MAX_MEMBERS_PER_GROUP;
+        status = sai_ars_profile_api->get_ars_profile_attribute(profile.m_sai_ars_id, 1, &attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("Failed to get ars profile %s (oid 0x%" PRIx64 ") attr SAI_ARS_PROFILE_ATTR_ECMP_ARS_MAX_MEMBERS_PER_GROUP: %d",
+                profile.profile_name.c_str(), profile.m_sai_ars_id, status);
+            attr.value.u32 = 0;
+        }
+    }
+    profile.max_ecmp_members_per_group = attr.value.u32;
+
+    sai_attribute_t switch_attr;
+    switch_attr.id = SAI_SWITCH_ATTR_ARS_PROFILE;
+    switch_attr.value.oid = profile.m_sai_ars_id;
+
+    status = sai_switch_api->set_switch_attribute(gSwitchId, &switch_attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to set switch ARS profile to %s: %d",
+                       profile.profile_name.c_str(), status);
+    }
+    else
+    {
+        SWSS_LOG_NOTICE("Set switch ARS profile to %s (oid 0x%" PRIx64 ")",
+                        profile.profile_name.c_str(), profile.m_sai_ars_id);
+    }
+
+    SWSS_LOG_NOTICE("Created ARS profile %s (oid 0x%" PRIx64 ")", profile.profile_name.c_str(), profile.m_sai_ars_id);
 
     return true;
 }
@@ -461,31 +780,31 @@ bool ArsOrch::setArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t> &a
 {
     SWSS_LOG_ENTER();
 
-    sai_status_t    status = SAI_STATUS_NOT_SUPPORTED;
+    sai_status_t status = SAI_STATUS_NOT_SUPPORTED;
 
     /* go over set of attr and set only supported attributes  */
-    for (auto a : ars_attrs)
+    for (auto attr : ars_attrs)
     {
-        if (!isSetImplemented(SAI_OBJECT_TYPE_ARS_PROFILE, a.id))
+        if (!isSetImplemented(SAI_OBJECT_TYPE_ARS_PROFILE, attr.id))
         {
-            if (a.id == SAI_ARS_PROFILE_ATTR_ENABLE_IPV4 || a.id == SAI_ARS_PROFILE_ATTR_ENABLE_IPV6)
+            if (attr.id == SAI_ARS_PROFILE_ATTR_ENABLE_IPV4 || attr.id == SAI_ARS_PROFILE_ATTR_ENABLE_IPV6)
             {
-                SWSS_LOG_WARN("Setting Attr %d is not supported. Failed to set ARS profile %s (oid %" PRIx64 ") value %s",
-                               a.id, profile.profile_name.c_str(), profile.m_sai_ars_id, a.value.booldata ? "true" : "false");
+                SWSS_LOG_WARN("Setting Attr %d is not supported. Failed to set ARS profile %s (oid 0x%" PRIx64 ") value %s",
+                               attr.id, profile.profile_name.c_str(), profile.m_sai_ars_id, attr.value.booldata ? "true" : "false");
             }
             else
             {
-                SWSS_LOG_WARN("Setting Attr %d is not supported. Failed to set ARS profile %s (oid %" PRIx64 ") value %u",
-                               a.id, profile.profile_name.c_str(), profile.m_sai_ars_id, a.value.u32);
+                SWSS_LOG_WARN("Setting Attr %d is not supported. Failed to set ARS profile %s (oid 0x%" PRIx64 ") value %u",
+                               attr.id, profile.profile_name.c_str(), profile.m_sai_ars_id, attr.value.u32);
             }
             continue;
         }
 
-        status = sai_ars_profile_api->set_ars_profile_attribute(profile.m_sai_ars_id, &a);
+        status = sai_ars_profile_api->set_ars_profile_attribute(profile.m_sai_ars_id, &attr);
         if (status != SAI_STATUS_SUCCESS)
         {
-            SWSS_LOG_ERROR("Failed to set ars profile %s (oid %" PRIx64 ") attr %d: %d",
-                profile.profile_name.c_str(), profile.m_sai_ars_id, a.id, status);
+            SWSS_LOG_ERROR("Failed to set ars profile %s (oid 0x%" PRIx64 ") attr %d: %d",
+                profile.profile_name.c_str(), profile.m_sai_ars_id, attr.id, status);
             task_process_status handle_status = handleSaiSetStatus(SAI_API_ARS, status);
             if (handle_status != task_success)
             {
@@ -497,74 +816,273 @@ bool ArsOrch::setArsProfile(ArsProfileEntry &profile, vector<sai_attribute_t> &a
     return true;
 }
 
-bool ArsOrch::createArsObject(ArsObjectEntry *object, vector<sai_attribute_t> &ars_attrs)
+bool ArsOrch::deleteArsProfile(ArsProfileEntry &profile)
 {
     SWSS_LOG_ENTER();
 
-    sai_status_t    status = SAI_STATUS_NOT_SUPPORTED;
-    vector<sai_attribute_t> supported_ars_attrs;
+    sai_status_t status = SAI_STATUS_SUCCESS;
 
-    /* go over set of attr and set only supported attributes  */
-    for (auto a : ars_attrs)
+    if (profile.m_sai_ars_id == SAI_NULL_OBJECT_ID)
     {
-        if (isCreateImplemented(SAI_OBJECT_TYPE_ARS, a.id))
-        {
-            supported_ars_attrs.push_back(a);
-            SWSS_LOG_NOTICE("ARS %s. Setting Attr %d value %u",
-                             object->profile_name.c_str(), a.id, a.value.u32);
-        }
-        else
-        {
-            SWSS_LOG_WARN("Setting Attr %d is not supported. Failed to set ARS %s value %u",
-                           a.id, object->profile_name.c_str(), a.value.u32);
-            continue;
-        }
-    }
-
-    if (supported_ars_attrs.empty())
-    {
-        SWSS_LOG_WARN("No supported attributes found for ARS %s", object->profile_name.c_str());
+        SWSS_LOG_WARN("ARS profile %s has invalid SAI object ID; skipping delete",
+                      profile.profile_name.c_str());
         return false;
     }
 
-    status = sai_ars_api->create_ars(&object->ars_object_id,
-                                     gSwitchId,
-                                     (uint32_t)supported_ars_attrs.size(),
-                                     supported_ars_attrs.data());
+    sai_attribute_t switch_attr;
+    switch_attr.id = SAI_SWITCH_ATTR_ARS_PROFILE;
+    status = sai_switch_api->get_switch_attribute(gSwitchId , 1, &switch_attr);
+    if (status == SAI_STATUS_SUCCESS && switch_attr.value.oid == profile.m_sai_ars_id)
+    {
+        switch_attr.value.oid = SAI_NULL_OBJECT_ID;
+        status = sai_switch_api->set_switch_attribute(gSwitchId, &switch_attr);
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("Failed to unset switch ARS profile %s: %d",
+                           profile.profile_name.c_str(), status);
+        }
+        else
+        {
+            SWSS_LOG_NOTICE("Unset switch ARS profile %s", profile.profile_name.c_str());
+        }
+    }
+    SWSS_LOG_NOTICE("Deleting ARS profile %s (oid 0x%" PRIx64 ")",
+                    profile.profile_name.c_str(), profile.m_sai_ars_id);
+
+    status = sai_ars_profile_api->remove_ars_profile(profile.m_sai_ars_id);
+
     if (status != SAI_STATUS_SUCCESS)
     {
-        SWSS_LOG_ERROR("Failed to create ars %s: %d", object->profile_name.c_str(), status);
-        task_process_status handle_status = handleSaiSetStatus(SAI_API_ARS, status);
+        SWSS_LOG_ERROR("Failed to delete ARS profile %s (oid 0x%" PRIx64 "): status=%d",
+                       profile.profile_name.c_str(), profile.m_sai_ars_id, status);
+
+        task_process_status handle_status = handleSaiSetStatus(SAI_API_ARS_PROFILE, status);
         if (handle_status != task_success)
         {
             return parseHandleSaiStatusFailure(handle_status);
         }
+
+        return false;
+    }
+
+    profile.m_sai_ars_id = SAI_NULL_OBJECT_ID;
+    profile.max_ecmp_groups = 0;
+    profile.max_ecmp_members_per_group = 0;
+
+    SWSS_LOG_NOTICE("Deleted ARS profile %s successfully", profile.profile_name.c_str());
+    return true;
+}
+
+
+void ArsOrch::processArsInterfaces(bool enable, std::uint32_t scaling_factor)
+{
+    SWSS_LOG_ENTER();
+    const auto &nh_member_list = gPortsOrch->getAllPorts();
+
+    for (const auto &it : nh_member_list)
+    {
+        const auto &port = it.second;
+
+        if (port.m_type != Port::PHY)
+            continue;
+
+        bool alreadyEnabled = (m_arsEnabledInterfaces.find(port.m_alias) != m_arsEnabledInterfaces.end());
+
+        if (enable && !alreadyEnabled)
+        {
+            SWSS_LOG_INFO("Creating ARS interface for port: %s", port.m_alias.c_str());
+            updateArsEnabledInterface(port, scaling_factor, true);
+        }
+        else if (!enable && alreadyEnabled)
+        {
+            SWSS_LOG_INFO("Removing ARS interface for port: %s", port.m_alias.c_str());
+            updateArsEnabledInterface(port, scaling_factor, false);
+        }
+    }
+}
+
+void ArsOrch::createArsProfileSelectorMode(ArsProfileEntry &profile, ArsSelectorModeNhg new_nhg_mode, ArsSelectorModeNhg prev_nhg_mode)
+{
+    SWSS_LOG_ENTER();
+
+    std::uint32_t scaling_factor = 0;
+
+    if (new_nhg_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_GLOBAL)
+    {
+        SWSS_LOG_INFO("NHG ARS profile '%s' switched to GLOBAL mode. Creating ARS interfaces for all ports.",
+                      profile.profile_name.c_str());
+        processArsInterfaces(true, scaling_factor);
+    }
+    else if ((new_nhg_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INTERFACE ||
+              new_nhg_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_NEXTHOP) &&
+             prev_nhg_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_GLOBAL)
+    {
+        SWSS_LOG_INFO("NHG ARS profile '%s' switched from GLOBAL to INTERFACE/NEXTHOP. Removing ARS interfaces from unused ports.",
+                      profile.profile_name.c_str());
+        processArsInterfaces(false, scaling_factor);
+    }
+}
+
+std::vector<sai_attribute_t> ArsOrch::buildArsAttributesFromObject(ArsObjectEntry *object)
+{
+    SWSS_LOG_ENTER();
+
+    std::vector<sai_attribute_t> ars_attrs;
+    if (!object)
+    {
+        SWSS_LOG_WARN("ARS object is nullptr");
+        return ars_attrs;
+    }
+
+    sai_attribute_t attr;
+
+    // Check differences with prev applied values
+    if (!m_arsObjects.empty())
+    {
+        auto it = m_arsObjects.find(object->ars_obj_name);
+        if (it != m_arsObjects.end())
+        {
+            ArsObjectEntry &prev = it->second;
+
+            if (object->assign_mode != prev.assign_mode)
+            {
+                attr.id = SAI_ARS_ATTR_MODE;
+                attr.value.u32 = object->assign_mode;
+                ars_attrs.push_back(attr);
+            }
+
+            if (object->flowlet_idle_time != prev.flowlet_idle_time)
+            {
+                attr.id = SAI_ARS_ATTR_IDLE_TIME;
+                attr.value.u32 = object->flowlet_idle_time;
+                ars_attrs.push_back(attr);
+            }
+
+            if (object->max_flows != prev.max_flows)
+            {
+                attr.id = SAI_ARS_ATTR_MAX_FLOWS;
+                attr.value.u32 = object->max_flows;
+                ars_attrs.push_back(attr);
+            }
+
+            if (object->primary_path_threshold != prev.primary_path_threshold)
+            {
+                attr.id = SAI_ARS_ATTR_PRIMARY_PATH_QUALITY_THRESHOLD;
+                attr.value.u32 = object->primary_path_threshold;
+                ars_attrs.push_back(attr);
+            }
+
+            if (object->alternative_path_cost != prev.alternative_path_cost)
+            {
+                attr.id = SAI_ARS_ATTR_ALTERNATE_PATH_COST;
+                attr.value.u32 = object->alternative_path_cost;
+                ars_attrs.push_back(attr);
+            }
+
+            return ars_attrs;
+        }
+    }
+
+    /* first time create, fill everything */
+    attr.id = SAI_ARS_ATTR_MODE;
+    attr.value.u32 = object->assign_mode;
+    ars_attrs.push_back(attr);
+
+    attr.id = SAI_ARS_ATTR_IDLE_TIME;
+    attr.value.u32 = object->flowlet_idle_time;
+    ars_attrs.push_back(attr);
+
+    attr.id = SAI_ARS_ATTR_MAX_FLOWS;
+    attr.value.u32 = object->max_flows;
+    ars_attrs.push_back(attr);
+
+    attr.id = SAI_ARS_ATTR_PRIMARY_PATH_QUALITY_THRESHOLD;
+    attr.value.u32 = object->primary_path_threshold;
+    ars_attrs.push_back(attr);
+
+    attr.id = SAI_ARS_ATTR_ALTERNATE_PATH_COST;
+    attr.value.u32 = object->alternative_path_cost;
+    ars_attrs.push_back(attr);
+
+    return ars_attrs;
+}
+
+
+
+bool ArsOrch::createArsObject(ArsObjectEntry *object)
+{
+    SWSS_LOG_ENTER();
+
+    if (!object)
+    {
+        SWSS_LOG_ERROR("createArsObject: null object pointer");
+        return false;
+    }
+
+    auto ars_attrs = buildArsAttributesFromObject(object);
+    std::vector<sai_attribute_t> supported_attrs;
+
+    for (auto &attr : ars_attrs)
+    {
+        if (isCreateImplemented(SAI_OBJECT_TYPE_ARS, attr.id))
+        {
+            supported_attrs.push_back(attr);
+            SWSS_LOG_NOTICE("ARS object: setting attr %d value %u", attr.id, attr.value.u32);
+        }
+        else
+        {
+            SWSS_LOG_WARN("Attr %d not supported for create ARS object", attr.id);
+        }
+    }
+
+    if (supported_attrs.empty())
+    {
+        SWSS_LOG_WARN("No supported attrs for ARS object");
+        return false;
+    }
+
+    sai_status_t status = sai_ars_api->create_ars(
+        &object->ars_object_id,
+        gSwitchId,
+        (uint32_t)supported_attrs.size(),
+        supported_attrs.data());
+
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to create ARS object: %d", status);
+        return parseHandleSaiStatusFailure(handleSaiSetStatus(SAI_API_ARS, status));
     }
 
     return true;
 }
 
-bool ArsOrch::setArsObject(ArsObjectEntry *object, vector<sai_attribute_t> &ars_attrs)
+bool ArsOrch::setArsObject(ArsObjectEntry *object)
 {
     SWSS_LOG_ENTER();
 
-    sai_status_t    status = SAI_STATUS_NOT_SUPPORTED;
+    if (!object)
+    {
+        SWSS_LOG_ERROR("setArsObject: null object pointer");
+        return false;
+    }
 
-    /* go over set of attr and set only supported attributes  */
-    for (auto a : ars_attrs)
+    auto ars_attrs = buildArsAttributesFromObject(object);
+    sai_status_t status = SAI_STATUS_NOT_SUPPORTED;
+
+    for (auto &a : ars_attrs)
     {
         if (!isSetImplemented(SAI_OBJECT_TYPE_ARS, a.id))
         {
-            SWSS_LOG_WARN("Setting Attr %d is not supported. Failed to set ARS %s (oid %" PRIx64 ") value %u",
-                        a.id, object->profile_name.c_str(), object->ars_object_id, a.value.u32);
+            SWSS_LOG_WARN("Setting attr %d not supported. ARS oid 0x%" PRIx64 ")",
+                          a.id, object->ars_object_id);
             continue;
         }
 
         status = sai_ars_api->set_ars_attribute(object->ars_object_id, &a);
         if (status != SAI_STATUS_SUCCESS)
         {
-            SWSS_LOG_ERROR("Failed to set ars %s (oid %" PRIx64 ") attr %d: %d",
-                            object->profile_name.c_str(), object->ars_object_id, a.id, status);
+            SWSS_LOG_ERROR("Failed to set ARS attr %d: %d", a.id, status);
+
             task_process_status handle_status = handleSaiSetStatus(SAI_API_ARS, status);
             if (handle_status != task_success)
             {
@@ -585,8 +1103,8 @@ bool ArsOrch::delArsObject(ArsObjectEntry *object)
     status = sai_ars_api->remove_ars(object->ars_object_id);
     if (status != SAI_STATUS_SUCCESS)
     {
-        SWSS_LOG_ERROR("Failed to remove ars %s (oid %" PRIx64 ": %d)",
-                        object->profile_name.c_str(), object->ars_object_id, status);
+        SWSS_LOG_ERROR("Failed to remove ars object%s (oid 0x%" PRIx64 ": %d)",
+                        object->ars_obj_name.c_str(), object->ars_object_id, status);
         task_process_status handle_status = handleSaiSetStatus(SAI_API_ARS, status);
         if (handle_status != task_success)
         {
@@ -597,13 +1115,13 @@ bool ArsOrch::delArsObject(ArsObjectEntry *object)
     return true;
 }
 
-bool ArsOrch::updateArsEnabledInterface(const Port &port, const bool is_enable)
+bool ArsOrch::updateArsEnabledInterface(const Port &port, const uint32_t scaling_factor, const bool is_enable)
 {
     SWSS_LOG_ENTER();
 
     if (isSetImplemented(SAI_OBJECT_TYPE_PORT, SAI_PORT_ATTR_ARS_ENABLE))
     {
-    if (!gPortsOrch->setPortArsEnable(port, is_enable))
+        if (!gPortsOrch->setPortArsEnable(port, is_enable))
         {
             SWSS_LOG_ERROR("Failed to set ars enable for port %s", port.m_alias.c_str());
             return false;
@@ -612,7 +1130,7 @@ bool ArsOrch::updateArsEnabledInterface(const Port &port, const bool is_enable)
 
     if (isSetImplemented(SAI_OBJECT_TYPE_PORT, SAI_PORT_ATTR_ARS_PORT_LOAD_SCALING_FACTOR))
     {
-        if (is_enable && !gPortsOrch->setPortArsLoadScaling(port))
+        if (is_enable && !gPortsOrch->setPortArsLoadScaling(port, scaling_factor))
         {
             SWSS_LOG_ERROR("Failed to set ars load scaling factor for port %s", port.m_alias.c_str());
             return false;
@@ -624,6 +1142,66 @@ bool ArsOrch::updateArsEnabledInterface(const Port &port, const bool is_enable)
                     is_enable ? "en" : "dis");
 
     return true;
+}
+
+bool ArsOrch::findDefaultArsObject(const ArsSelectorModeNhg& selector_mode, std::string& ars_obj_name)
+{
+    SWSS_LOG_ENTER();
+    for (const auto& profile_pair : m_arsProfiles)
+    {
+        const ArsProfileEntry& profile = profile_pair.second;
+
+        if (profile.nhg_selector_mode == selector_mode &&
+            !profile.default_ars_object.empty())
+        {
+
+            ars_obj_name = profile.default_ars_object;
+            SWSS_LOG_INFO("Using default ars_obj_name '%s' from profile '%s'",
+                         ars_obj_name.c_str(), profile.profile_name.c_str());
+            return true;
+        }
+    }
+    return false;
+}
+
+ArsSelectorModeNhg ArsOrch::parseNhgSelectorMode(const std::string &nhg_mode) const
+{
+    SWSS_LOG_ENTER();
+    if (nhg_mode == "global")
+    {
+        return ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_GLOBAL;
+    }
+    else if (nhg_mode == "interface")
+    {
+        return ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INTERFACE;
+    }
+    else if (nhg_mode == "nexthop")
+    {
+        return ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_NEXTHOP;
+    }
+    else
+    {
+        // Invalid mode
+        return ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INVALID;
+    }
+}
+
+ArsSelectorModeLag ArsOrch::parseLagSelectorMode(const std::string &modeStr) const
+{
+    SWSS_LOG_ENTER();
+    if (modeStr == "global")
+    {
+        return ArsSelectorModeLag::ARS_SELECTOR_MODE_LAG_GLOBAL;
+    }
+    else if (modeStr == "interface")
+    {
+        return ArsSelectorModeLag::ARS_SELECTOR_MODE_LAG_INTERFACE;
+    }
+    else
+    {
+        // Invalid mode
+        return ArsSelectorModeLag::ARS_SELECTOR_MODE_LAG_INVALID;
+    }
 }
 
 bool ArsOrch::doTaskArsProfile(Consumer &consumer)
@@ -648,6 +1226,11 @@ bool ArsOrch::doTaskArsProfile(Consumer &consumer)
         bool is_new_entry = false;
         sai_attribute_t         ars_attr;
         vector<sai_attribute_t> ars_attrs;
+        std::string             default_ars_object;
+        ArsSelectorModeNhg nhg_mode = ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INTERFACE;
+        ArsSelectorModeNhg new_nhg_mode = ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INTERFACE;
+        ArsSelectorModeLag lag_mode = ArsSelectorModeLag::ARS_SELECTOR_MODE_LAG_INTERFACE;
+        ArsSelectorModeLag new_lag_mode = ArsSelectorModeLag::ARS_SELECTOR_MODE_LAG_INTERFACE;
 
         SWSS_LOG_NOTICE("OP: %s, Profile: %s", op.c_str(), ars_profile_name.c_str());
 
@@ -674,6 +1257,9 @@ bool ArsOrch::doTaskArsProfile(Consumer &consumer)
                 future_load_weight = arsProfile_entry->second.path_metrics.future_load.weight;
                 current_load_min_val = arsProfile_entry->second.path_metrics.future_load.min_value;
                 current_load_max_val = arsProfile_entry->second.path_metrics.future_load.max_value;
+                nhg_mode = arsProfile_entry->second.nhg_selector_mode;
+                lag_mode = arsProfile_entry->second.lag_selector_mode;
+                default_ars_object = arsProfile_entry->second.default_ars_object;
             }
 
             for (auto i : kfvFieldsValues(t))
@@ -687,7 +1273,15 @@ bool ArsOrch::doTaskArsProfile(Consumer &consumer)
                 }
                 else if (fvField(i) == ARS_FIELD_NAME_ALGORITHM)
                 {
-                    algo = (ArsAlgorithm)stoi(fvValue(i));
+                    if (fvValue(i) == "ewma")
+                    {
+                        algo = ARS_ALGORITHM_EWMA;
+                    }
+                    else
+                    {
+                        SWSS_LOG_WARN("Received unsupported algorithm %s", fvValue(i).c_str());
+                        continue;
+                    }
                     ars_attr.id = SAI_ARS_PROFILE_ATTR_ALGO;
                     ars_attr.value.u32 = algo;
                     ars_attrs.push_back(ars_attr);
@@ -769,6 +1363,33 @@ bool ArsOrch::doTaskArsProfile(Consumer &consumer)
                     ars_attr.value.u32 = current_load_max_val;
                     ars_attrs.push_back(ars_attr);
                 }
+                else if (fvField(i) == ARS_FIELD_NAME_NHG_PATH_SELECTOR_MODE)
+                {
+                    new_nhg_mode = parseNhgSelectorMode(fvValue(i));
+                    if (new_nhg_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INVALID)
+                    {
+                        SWSS_LOG_ERROR("Invalid NHG selector mode: %s", fvValue(i).c_str());
+                        continue;
+                    }
+                    if(new_nhg_mode != nhg_mode)
+                    {
+                       createArsProfileSelectorMode(arsProfile_entry->second, new_nhg_mode, nhg_mode);
+                       nhg_mode = new_nhg_mode;
+                    }
+                }
+                else if (fvField(i) == ARS_FIELD_NAME_LAG_PATH_SELECTOR_MODE)
+                {
+                    new_lag_mode = parseLagSelectorMode(fvValue(i));
+                    if (new_lag_mode == ArsSelectorModeLag::ARS_SELECTOR_MODE_LAG_INVALID)
+                    {
+                        SWSS_LOG_ERROR("Invalid LAG selector mode: %s", fvValue(i).c_str());
+                        continue;
+                    }
+                }
+                else if (fvField(i) == ARS_FIELD_NAME_DEFAULT_OBJECT)
+                {
+                    default_ars_object = fvValue(i);
+                }
                 else
                 {
                     SWSS_LOG_WARN("Received unsupported field %s", fvField(i).c_str());
@@ -801,6 +1422,9 @@ bool ArsOrch::doTaskArsProfile(Consumer &consumer)
             arsProfile_entry->second.path_metrics.future_load.weight = future_load_weight;
             arsProfile_entry->second.path_metrics.current_load.min_value = current_load_min_val;
             arsProfile_entry->second.path_metrics.current_load.max_value = current_load_max_val;
+            arsProfile_entry->second.nhg_selector_mode = nhg_mode;
+            arsProfile_entry->second.lag_selector_mode = lag_mode;
+            arsProfile_entry->second.default_ars_object = default_ars_object;
 
             bool res;
             if (is_new_entry)
@@ -817,7 +1441,29 @@ bool ArsOrch::doTaskArsProfile(Consumer &consumer)
                 SWSS_LOG_ERROR("Failed to create/set ARS profile %s", ars_profile_name.c_str());
                 continue;
             }
+            if (new_nhg_mode == ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INTERFACE)
+            {
+                if (!default_ars_object.empty())
+                {
+                    // Scan interface_table and update ars_object_name
+                    for (auto &entry : m_arsEnabledInterfaces)
+                    {
+                        auto &ars_pair = entry.second;
 
+                        // Update ars_object_name if not already set
+                        if (ars_pair.second.empty())
+                        {
+                            ars_pair.second = default_ars_object;
+                            SWSS_LOG_INFO("Updated ARS object for interface %s to default %s",
+                                           entry.first.c_str(), default_ars_object.c_str());
+                        }
+                    }
+                }
+            }
+            FieldValueTuple groups("max_ecmp_groups", std::to_string(arsProfile_entry->second.max_ecmp_groups));
+            fvVector.push_back(groups);
+            FieldValueTuple members("max_ecmp_members_per_group", std::to_string(arsProfile_entry->second.max_ecmp_members_per_group));
+            fvVector.push_back(members);
             m_arsProfileStateTable->set(ars_profile_name, fvVector);
         }
         else if (op == DEL_COMMAND)
@@ -829,7 +1475,7 @@ bool ArsOrch::doTaskArsProfile(Consumer &consumer)
             else 
             {
                 /* Check if there are no child objects associated prior to deleting */
-                if (arsProfile_entry->second.ref_count == 0 && m_arsEnabledInterfaces.empty())
+                if (m_arsEnabledInterfaces.empty())
                 {
                     SWSS_LOG_INFO("Received delete call for valid entry with no further dependencies, deleting %s",
                         ars_profile_name.c_str());
@@ -840,7 +1486,7 @@ bool ArsOrch::doTaskArsProfile(Consumer &consumer)
                             ars_profile_name.c_str());
                     continue;
                 }
-
+                deleteArsProfile(arsProfile_entry->second);
                 m_arsProfiles.erase(arsProfile_entry);
                 m_arsProfileStateTable->del(ars_profile_name);
             }
@@ -870,36 +1516,83 @@ bool ArsOrch::doTaskArsInterfaces(Consumer &consumer)
         string table_id = key.substr(0, found);
         string if_name = key.substr(found + 1);
         string op = kfvOp(t);
-        vector<sai_attribute_t> ars_attrs;
         Port p;
+        std::uint32_t scaling_factor = 0;
+        std::string ars_obj_name;
 
         SWSS_LOG_NOTICE("ARS Path Op %s Interface %s", op.c_str(), if_name.c_str());
 
         if (op == SET_COMMAND)
         {
-            if (m_arsEnabledInterfaces.find(if_name) != m_arsEnabledInterfaces.end()) 
+            auto ars_if = m_arsEnabledInterfaces.find(if_name);
+
+            for (auto i : kfvFieldsValues(t))
             {
-                SWSS_LOG_WARN("Tried to add already added interface %s - skipped", if_name.c_str());
-                it = consumer.m_toSync.erase(it);
-                continue;
+                if (fvField(i) == ARS_FIELD_NAME_SCALING_FACTOR)
+                {
+                    scaling_factor = static_cast<uint32_t>(stoi(fvValue(i)));
+
+                    if (ars_if != m_arsEnabledInterfaces.end() && ars_if->second.first == scaling_factor)
+                    {
+                        SWSS_LOG_WARN("Scaling factor %s for interface %s unchanged - skipped",
+                                      fvValue(i).c_str(), if_name.c_str());
+                        it = consumer.m_toSync.erase(it);
+                        continue;
+                    }
+                }
+                else if (fvField(i) == ARS_FIELD_NAME_OBJECT_NAME)
+                {
+                    ars_obj_name = fvValue(i);
+                    if (!ars_obj_name.empty())
+                    {
+                        SWSS_LOG_INFO("Received ars_obj_name '%s' for interface %s",
+                                     ars_obj_name.c_str(), if_name.c_str());
+                    }
+                    else
+                    {
+                        SWSS_LOG_INFO("Received empty ars_obj_name for interface %s", if_name.c_str());
+                    }
+
+                }
+                else
+                {
+                    SWSS_LOG_WARN("Received unsupported field %s", fvField(i).c_str());
+                    continue;
+                }
+
             }
-        
-            m_arsEnabledInterfaces.insert(if_name);
-            SWSS_LOG_NOTICE("Added new ARS-enabled interface %s", if_name.c_str());
+
+            /* Apply default ARS object if not provided */
+            if (ars_obj_name.empty())
+            {
+                bool result = findDefaultArsObject(ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_INTERFACE, 
+                                  ars_obj_name);
+                if (!result)
+                {
+                   /* No suitable ars object found */
+                    SWSS_LOG_WARN(
+                    "NHG path selector is in INTERFACE mode, but no ARS object is configured "
+                    "either in the ARS profile 'default_ars_object' or in the ARS interface 'ars_obj_name'");
+                }
+            }
+
+            m_arsEnabledInterfaces[if_name] = std::make_pair(scaling_factor, ars_obj_name);
+            SWSS_LOG_NOTICE("Added/Updated interface %s scaling_factor %d obj_name '%s'",
+                            if_name.c_str(), scaling_factor, ars_obj_name.c_str());
         }
         else if (op == DEL_COMMAND)
         {
-            if (m_arsEnabledInterfaces.find(if_name) == m_arsEnabledInterfaces.end())
+            auto ars_if = m_arsEnabledInterfaces.find(if_name);
+            if (ars_if == m_arsEnabledInterfaces.end())
             {
-                SWSS_LOG_INFO("Received delete call for non-existent interface %s", if_name.c_str());
+                SWSS_LOG_INFO("Delete called for non-existent interface %s", if_name.c_str());
                 it = consumer.m_toSync.erase(it);
                 continue;
             }
-            else
-            {
-                m_arsEnabledInterfaces.erase(if_name);
-                SWSS_LOG_INFO("Removed interface %s", if_name.c_str());
-            }
+
+            SWSS_LOG_INFO("Removing interface %s with obj_name '%s'",
+                          if_name.c_str(), ars_if->second.second.c_str());
+            m_arsEnabledInterfaces.erase(ars_if);
         }
 
         if (!gPortsOrch->getPort(if_name, p) || p.m_port_id == SAI_NULL_OBJECT_ID)
@@ -908,250 +1601,108 @@ bool ArsOrch::doTaskArsInterfaces(Consumer &consumer)
         }
         else
         {
-            updateArsEnabledInterface(p, (op == SET_COMMAND));
+            updateArsEnabledInterface(p, scaling_factor, (op == SET_COMMAND));
         }
 
         it = consumer.m_toSync.erase(it);
     }
 
+  // Update ARS state table with scaling factor and ars_obj_name
     string ifnames = "";
-    for (auto ifname : m_arsEnabledInterfaces)
+    for (const auto &entry : m_arsEnabledInterfaces)
     {
-        ifnames += ifname + " ";
+        ifnames += entry.first + ":" + std::to_string(entry.second.first) +
+                   ":" + entry.second.second + " "; // format: if_name:scaling:obj_name
     }
-    FieldValueTuple tmp("ifname", ifnames);
-    vector<FieldValueTuple> fvVector;
-    fvVector.push_back(tmp);
-    m_arsIfStateTable->set("", fvVector);
-
     return true;
 }
-
-bool ArsOrch::doTaskArsNexthopGroup(Consumer &consumer)
+bool ArsOrch::doTaskArsObject(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
+    bool status = false;
 
     auto it = consumer.m_toSync.begin();
     while (it != consumer.m_toSync.end())
     {
         KeyOpFieldsValuesTuple t = it->second;
-        string key = kfvKey(t);
-        size_t found = key.find(consumer.getConsumerTable()->getTableNameSeparator().c_str());
-        IpPrefix ip_prefix = IpPrefix(key.substr(0, found));
-        string vrf_name = key.substr(found + 1);
+        string ars_obj_name = kfvKey(t);
         string op = kfvOp(t);
-        bool is_new_entry = false;
-        sai_attribute_t         ars_attr;
-        vector<sai_attribute_t> ars_attrs;
-        string ars_profile_name = "";
 
-        SWSS_LOG_NOTICE("ARS Prefix Op %s, Profile: %s, Vrf %s, Prefix %s", op.c_str(), ars_profile_name.c_str(), vrf_name.c_str(), ip_prefix.to_string().c_str());
+        SWSS_LOG_NOTICE("ARS Object Op %s, Object Name %s", op.c_str(), ars_obj_name.c_str());
 
-        auto table = m_arsNexthopGroupPrefixes.find(vrf_name);
-        sai_object_id_t vrf_id = m_vrfOrch->getVRFid(vrf_name);
-        NextHopGroupKey nhg = gRouteOrch->getSyncdRouteNhgKey(vrf_id, ip_prefix);
+        ArsObjectEntry ars_object;
 
-        ArsObjectEntry *arsObject_entry = nullptr;
         if (op == SET_COMMAND)
         {
-            vector<FieldValueTuple> fvVector;
+            // Set defaults
+            ars_object.assign_mode = PER_FLOWLET_QUALITY;
+            ars_object.flowlet_idle_time = ARS_OBJECT_DEFAULT_FLOWLET_IDLE_TIME_US;
+            ars_object.max_flows = ARS_OBJECT_DEFAULT_MAX_FLOWS;
+            ars_object.primary_path_threshold = ARS_OBJECT_DEFAULT_PRIMARY_PATH_THRESHOLD;
+            ars_object.alternative_path_cost = ARS_OBJECT_DEFAULT_ALTERNATIVE_PATH_COST;
 
-            if (table == m_arsNexthopGroupPrefixes.end())
+            // Override with incoming fields
+            for (auto fv : kfvFieldsValues(t))
             {
-                is_new_entry = true;
-                ArsNexthopGroupPrefixes tmp_nhg_table;
-                ArsObjectEntry arsObjectEntry;
-                arsObjectEntry.profile_name = "dummy";
-                tmp_nhg_table[ip_prefix] = arsObjectEntry;
-                m_arsNexthopGroupPrefixes[vrf_name] = tmp_nhg_table;
-                table = m_arsNexthopGroupPrefixes.find(vrf_name);
+                if (fvField(fv) == ARS_FIELD_NAME_ASSIGN_MODE)
+                {
+                    if (fvValue(fv) == "per_flowlet_quality")
+                        ars_object.assign_mode = PER_FLOWLET_QUALITY;
+                    else if (fvValue(fv) == "per_packet_quality")
+                        ars_object.assign_mode = PER_PACKET_QUALITY;
+                    else
+                        SWSS_LOG_WARN("Unsupported assign_mode %s, using default", fvValue(fv).c_str());
+                }
+                else if (fvField(fv) == ARS_FIELD_NAME_IDLE_TIME)
+                    ars_object.flowlet_idle_time = static_cast<uint16_t>(stoi(fvValue(fv)));
+                else if (fvField(fv) == ARS_FIELD_NAME_OBJ_MAX_FLOWS)
+                    ars_object.max_flows = static_cast<uint32_t>(stoi(fvValue(fv)));
+                else if (fvField(fv) == ARS_FIELD_NAME_PRIMARY_PATH_THRESHOLD)
+                    ars_object.primary_path_threshold = static_cast<uint32_t>(stoi(fvValue(fv)));
+                else if (fvField(fv) == ARS_FIELD_NAME_ALTERNATIVE_PATH_COST)
+                    ars_object.alternative_path_cost = static_cast<uint32_t>(stoi(fvValue(fv)));
             }
 
-            auto& nhg_table = table->second;
-
-            if (nhg_table.find(ip_prefix) == nhg_table.end())
+            // Create or update ARS object in SAI
+            auto table_it = m_arsObjects.find(ars_obj_name);
+            if (table_it == m_arsObjects.end())
             {
-                is_new_entry = true;
-                ArsObjectEntry arsObjectEntry;
-                arsObjectEntry.profile_name = "dummy";
-                nhg_table[ip_prefix] = arsObjectEntry;
-            }
-
-            arsObject_entry = &nhg_table[ip_prefix];
-
-            for (auto i : kfvFieldsValues(t))
-            {
-                if (fvField(i) == ARS_FIELD_NAME_PROFILE_NAME)
+                /* Create new entry*/
+                ars_object.ars_obj_name = ars_obj_name;
+                status = createArsObject(&ars_object);
+                if (status)
                 {
-                    ars_profile_name = fvValue(i);
-                    arsObject_entry->profile_name = ars_profile_name;
+                    SWSS_LOG_NOTICE("ARS object created: %s", ars_obj_name.c_str());
                 }
-                else if (fvField(i) == ARS_FIELD_NAME_MAX_FLOWS)
-                {
-                    arsObject_entry->max_flows = stoi(fvValue(i));
-                    ars_attr.id = SAI_ARS_ATTR_MAX_FLOWS;
-                    ars_attr.value.u32 = arsObject_entry->max_flows;
-                    ars_attrs.push_back(ars_attr);
-                }
-                else if (fvField(i) == ARS_FIELD_NAME_IDLE_TIME)
-                {
-                    arsObject_entry->flowlet_idle_time = stoi(fvValue(i));
-                    ars_attr.id = SAI_ARS_ATTR_IDLE_TIME;
-                    ars_attr.value.u32 = arsObject_entry->flowlet_idle_time;
-                    ars_attrs.push_back(ars_attr);
-                }
-                else if (fvField(i) == ARS_FIELD_NAME_ASSIGN_MODE)
-                {
-                    arsObject_entry->assign_mode = PER_FLOWLET_QUALITY;
-                    ars_attr.id = SAI_ARS_ATTR_MODE;
-                    ars_attr.value.u32 = SAI_ARS_MODE_FLOWLET_QUALITY;
-                    if (fvValue(i) == ARS_FIELD_NAME_PER_PACKET)
-                    {
-                        arsObject_entry->assign_mode = PER_PACKET;
-                        ars_attr.value.u32 = SAI_ARS_MODE_PER_PACKET_QUALITY;
-                    }
-                    else if (fvValue(i) != ARS_FIELD_NAME_PER_FLOWLET)
-                    {
-                        SWSS_LOG_WARN("Received unsupported assign_mode %s, defaulted to per_flowlet_quality",
-                                        fvValue(i).c_str());
-                        break;
-                    }
-                    ars_attrs.push_back(ars_attr);
-                }
-                else if (fvField(i) == ARS_FIELD_NAME_PRIMARY_PATH_THRESHOLD)
-                {
-                    arsObject_entry->quality_threshold.primary_threshold = stoi(fvValue(i));
-                    ars_attr.id = SAI_ARS_ATTR_PRIMARY_PATH_QUALITY_THRESHOLD;
-                    ars_attr.value.u32 = arsObject_entry->quality_threshold.primary_threshold;
-                    ars_attrs.push_back(ars_attr);
-                }
-                else
-                {
-                    SWSS_LOG_WARN("Received unsupported field %s", fvField(i).c_str());
-                    continue;
-                }
-
-                FieldValueTuple value(fvField(i), fvValue(i));
-                fvVector.push_back(value);
-            }
-
-            if (ars_profile_name.empty())
-            {
-                SWSS_LOG_WARN("Received ARS NHG Vrf %s, Prefix %s without profile name", vrf_name.c_str(), ip_prefix.to_string().c_str());
-                continue;
-            }
-
-            auto arsProfile_entry = m_arsProfiles.find(ars_profile_name);
-            if (arsProfile_entry == m_arsProfiles.end())
-            {
-                SWSS_LOG_WARN("Received ARS NHG Vrf %s, Prefix %s for non-existent profile %s", vrf_name.c_str(), ip_prefix.to_string().c_str(), ars_profile_name.c_str());
-                continue;
-            }
-
-            if (is_new_entry)
-            {
-                arsObject_entry->profile_name = ars_profile_name;
-            }
-
-            FieldValueTuple tmp("nexthops", nhg.to_string());
-            fvVector.push_back(tmp);
-
-            if (is_new_entry)
-            {
-                createArsObject(arsObject_entry, ars_attrs);
-                gRouteOrch->attach(this, ip_prefix.getIp(), vrf_id);
-                arsProfile_entry->second.ref_count++;
             }
             else
             {
-                setArsObject(arsObject_entry, ars_attrs);
-            }
-
-            SWSS_LOG_NOTICE("Ars entry added for profile %s, prefix %s, NHs %s", ars_profile_name.c_str(), ip_prefix.to_string().c_str(), nhg.to_string().c_str());
-
-            m_arsNhgStateTable->set(vrf_name + "_" + ip_prefix.to_string(), fvVector);
-
-            if (nhg.getSize() > 0)
-            {
-                /* Handling ARS over already configured nexthop groups */
-                /* Enable ARS over NHG */
-                auto nhg_sai_id = gRouteOrch->getNextHopGroupId(nhg);
-                if (nhg_sai_id)
+                /*Exisitng object so set the particular field*/
+                ars_object.ars_object_id = table_it->second.ars_object_id;  // preserve oid
+                status = setArsObject(&ars_object);
+                if (status) 
                 {
-                    if (!isSetImplemented(SAI_OBJECT_TYPE_NEXT_HOP_GROUP, SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID))
-                    {
-                        SWSS_LOG_NOTICE("Remove existing NHG and create ARS-enabled");
-                        if (gRouteOrch->reconfigureNexthopGroupWithArsState(nhg, nhg_sai_id, arsObject_entry->ars_object_id))
-                        {
-                            addNhgToFlexCounter(nhg_sai_id, ip_prefix, vrf_name);
-                        }
-                    }
-                    /* just update the NHG attr */
-                    else if (gRouteOrch->updateNexthopGroupArsState(nhg_sai_id, arsObject_entry->ars_object_id))
-                    {
-                        addNhgToFlexCounter(nhg_sai_id, ip_prefix, vrf_name);
-                    }
-                    arsObject_entry->nexthops.insert(nhg);
+                    SWSS_LOG_NOTICE("ARS object updated: %s", ars_obj_name.c_str());
                 }
+            }
+            if (status)
+            {
+                m_arsObjects[ars_obj_name] = ars_object;
+            }
+            else
+            {
+                SWSS_LOG_ERROR("Failed to create/update ARS object %s, skipping map update", ars_obj_name.c_str());
             }
         }
         else if (op == DEL_COMMAND)
         {
-            auto table = m_arsNexthopGroupPrefixes.find(vrf_name);
-            if (table == m_arsNexthopGroupPrefixes.end() || table->second.find(ip_prefix) == table->second.end())
+            auto table_it = m_arsObjects.find(ars_obj_name);
+            if (table_it != m_arsObjects.end() && table_it->second.ars_object_id)
             {
-                SWSS_LOG_NOTICE("ARS_NHG_PREFIX doesn't exists, ignore");
-                it = consumer.m_toSync.erase(it);
-                continue;
+                delArsObject(&table_it->second);
             }
-            else if (!isSetImplemented(SAI_OBJECT_TYPE_NEXT_HOP_GROUP, SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID))
-            {
-                SWSS_LOG_NOTICE("Disabling ARS NHG is not supported");
-                it = consumer.m_toSync.erase(it);
-                continue;
-            }
-            else
-            {
-                arsObject_entry = &table->second[ip_prefix];
-                if (arsObject_entry->ars_object_id)
-                {
-                    /* handle existing nexthop group */
-                    if (nhg.getSize() > 0)
-                    {
-                        /* Disable ARS over NHG */
-                        auto sai_id = gRouteOrch->getNextHopGroupId(nhg);
-                        if (sai_id)
-                        {
-                            removeNhgFromFlexCounter(sai_id, ip_prefix, vrf_name);
-                            gRouteOrch->updateNexthopGroupArsState(sai_id, SAI_NULL_OBJECT_ID);
-                            arsObject_entry->nexthops.erase(nhg);
-                        }
-                    }
-                    gRouteOrch->detach(this, ip_prefix.getIp(), vrf_id);
-
-                    /* remove ars sai object */
-                    delArsObject(arsObject_entry);
-                }
-
-                table->second.erase(ip_prefix);
-                if (table->second.empty())
-                {
-                    m_arsNexthopGroupPrefixes.erase(vrf_name);
-                }
-                SWSS_LOG_NOTICE("Ars entry removed for profile %s, vrf_name %s,prefix %s", ars_profile_name.c_str(), vrf_name.c_str(), ip_prefix.to_string().c_str());
-
-                m_arsNhgStateTable->del(vrf_name + "_"  + ip_prefix.to_string());
-
-                auto arsProfile_entry = m_arsProfiles.find(arsObject_entry->profile_name);
-                if (arsProfile_entry == m_arsProfiles.end())
-                {
-                    SWSS_LOG_ERROR("Received ARS NHG Vrf %s, Prefix %s for non-existent profile %s", vrf_name.c_str(), ip_prefix.to_string().c_str(), arsObject_entry->profile_name.c_str());
-                }
-                else
-                {
-                    arsProfile_entry->second.ref_count--;
-                }
-            }
+            m_arsObjects.erase(ars_obj_name);
+            SWSS_LOG_NOTICE("ARS object deleted: %s", ars_obj_name.c_str());
         }
 
         it = consumer.m_toSync.erase(it);
@@ -1160,8 +1711,7 @@ bool ArsOrch::doTaskArsNexthopGroup(Consumer &consumer)
     return true;
 }
 
-
-bool ArsOrch::doTaskArsLag(Consumer &consumer)
+bool ArsOrch::doTaskArsNexthop(Consumer &consumer)
 {
     SWSS_LOG_ENTER();
 
@@ -1169,187 +1719,110 @@ bool ArsOrch::doTaskArsLag(Consumer &consumer)
     while (it != consumer.m_toSync.end())
     {
         KeyOpFieldsValuesTuple t = it->second;
-        string key = kfvKey(t);
+        std::string key = kfvKey(t);
+
+        /* Parse VRF and nexthop_ip from key*/
         size_t found = key.find(consumer.getConsumerTable()->getTableNameSeparator().c_str());
-        string if_name = key.substr(0, found);
-        string op = kfvOp(t);
-        bool is_new_entry = false;
-        sai_attribute_t         ars_attr;
-        vector<sai_attribute_t> ars_attrs;
-        Port p;
-        string ars_profile_name = "";
-        ArsObjectEntry *arsObject_entry = nullptr;
+        std::string vrf_name = key.substr(0, found);
+        IpAddress nexthop_ip(key.substr(found + 1));
+        std::string op = kfvOp(t);
+
+        SWSS_LOG_NOTICE("ARS NHG Op %s, VRF %s, Nexthop %s",
+                        op.c_str(), vrf_name.c_str(), nexthop_ip.to_string().c_str());
+
+        auto nexthop_key = std::make_pair(vrf_name, nexthop_ip);
 
         if (op == SET_COMMAND)
         {
-            if (m_arsLags.find(if_name) == m_arsLags.end())
+
+            // Find or create entry
+            auto itr = m_arsNexthops.find(nexthop_key);
+            if (itr == m_arsNexthops.end())
             {
-                is_new_entry = true;
-                ArsObjectEntry arsObjectEntry;
-                arsObjectEntry.profile_name = "dummy";
-                m_arsLags[if_name] = arsObjectEntry;
+                m_arsNexthops[nexthop_key] = ArsNexthopEntry();
+                itr = m_arsNexthops.find(nexthop_key);
             }
 
-            arsObject_entry = &m_arsLags[if_name];
-            SWSS_LOG_NOTICE("ARS Lag Op %s, Profile: %s, name %s", op.c_str(), arsObject_entry->profile_name.c_str(), if_name.c_str());
+            ArsNexthopEntry &ars_nexthop = itr->second;
 
-            vector<FieldValueTuple> fvVector;
-            for (auto i : kfvFieldsValues(t))
+            // Read fields
+            std::string ars_obj_name = "";
+            std::string role = "primary_path"; // default
+
+            for (auto fv : kfvFieldsValues(t))
             {
-                if (fvField(i) == ARS_FIELD_NAME_PROFILE_NAME)
+                if (fvField(fv) == ARS_FIELD_NAME_ARS_OBJ_NAME)
                 {
-                    ars_profile_name = fvValue(i);
-                    arsObject_entry->profile_name = ars_profile_name;
+                    ars_obj_name = fvValue(fv);
                 }
-                else if (fvField(i) == ARS_FIELD_NAME_MAX_FLOWS)
+                else if (fvField(fv) == ARS_FIELD_NAME_ROLE)
                 {
-                    arsObject_entry->max_flows = stoi(fvValue(i));
-                    ars_attr.id = SAI_ARS_ATTR_MAX_FLOWS;
-                    ars_attr.value.u32 = arsObject_entry->max_flows;
-                    ars_attrs.push_back(ars_attr);
-                }
-                else if (fvField(i) == ARS_FIELD_NAME_IDLE_TIME)
-                {
-                    arsObject_entry->flowlet_idle_time = stoi(fvValue(i));
-                    ars_attr.id = SAI_ARS_ATTR_IDLE_TIME;
-                    ars_attr.value.u32 = arsObject_entry->flowlet_idle_time;
-                    ars_attrs.push_back(ars_attr);
-                }
-                else if (fvField(i) == ARS_FIELD_NAME_ASSIGN_MODE)
-                {
-                    arsObject_entry->assign_mode = PER_FLOWLET_QUALITY;
-                    ars_attr.id = SAI_ARS_ATTR_MODE;
-                    ars_attr.value.u32 = SAI_ARS_MODE_FLOWLET_QUALITY;
-                    if (fvValue(i) == ARS_FIELD_NAME_PER_PACKET)
-                    {
-                        arsObject_entry->assign_mode = PER_PACKET;
-                        ars_attr.value.u32 = SAI_ARS_MODE_PER_PACKET_QUALITY;
-                    }
-                    else if (fvValue(i) != ARS_FIELD_NAME_PER_FLOWLET)
-                    {
-                        SWSS_LOG_WARN("Received unsupported assign_mode %s, defaulted to per_flowlet_quality",
-                                        fvValue(i).c_str());
-                        break;
-                    }
-                    ars_attrs.push_back(ars_attr);
-                }
-                else if (fvField(i) == ARS_FIELD_NAME_PRIMARY_PATH_THRESHOLD)
-                {
-                    arsObject_entry->quality_threshold.primary_threshold = stoi(fvValue(i));
-                    ars_attr.id = SAI_ARS_ATTR_PRIMARY_PATH_QUALITY_THRESHOLD;
-                    ars_attr.value.u32 = arsObject_entry->quality_threshold.primary_threshold;
-                    ars_attrs.push_back(ars_attr);
+                    role = fvValue(fv);
                 }
                 else
                 {
-                    SWSS_LOG_WARN("Received unsupported field %s", fvField(i).c_str());
-                    continue;
+                    SWSS_LOG_WARN("Unsupported field %s in ARS_NEXTHOP_LIST",
+                                  fvField(fv).c_str());
                 }
-
-                FieldValueTuple value(fvField(i), fvValue(i));
-                fvVector.push_back(value);
             }
 
-            if (ars_profile_name.empty())
+            /* Apply default ARS object if not provided */
+            if (ars_obj_name.empty())
             {
-                SWSS_LOG_WARN("Received ARS LAG %s without profile name", if_name.c_str());
+                bool result = findDefaultArsObject(ArsSelectorModeNhg::ARS_SELECTOR_MODE_NHG_NEXTHOP, 
+                                  ars_obj_name);
+                if (!result)
+                {
+                   /* No suitable profile found */
+                    SWSS_LOG_WARN("NHG path selector is in nexthop mode, but no default ARS object is configured");
+                }
+            }
+
+            /* Validate ARS object */
+            auto ars_obj_it = m_arsObjects.find(ars_obj_name);
+            if (ars_obj_it == m_arsObjects.end())
+            {
+                SWSS_LOG_ERROR("ARS object %s does not exist, cannot attach NHG",
+                               ars_obj_name.c_str());
+                it = consumer.m_toSync.erase(it);
                 continue;
             }
 
-            auto arsProfile_entry = m_arsProfiles.find(ars_profile_name);
+            ars_nexthop.ars_obj_name = ars_obj_name;
+            ars_nexthop.role = role;
 
-            if (arsProfile_entry == m_arsProfiles.end())
-            {
-                SWSS_LOG_WARN("Received ARS Lag name %s for non-existent profile %s", if_name.c_str(), ars_profile_name.c_str());
-                continue;
-            }
-
-            if (is_new_entry)
-            {
-                arsObject_entry->profile_name = ars_profile_name;
-            }
-
-            arsObject_entry->lags.insert(if_name);
-
-            if (is_new_entry)
-            {
-                createArsObject(arsObject_entry, ars_attrs);
-                arsProfile_entry->second.ref_count++;
-            }
-            else
-            {
-                setArsObject(arsObject_entry, ars_attrs);
-            }
-
-            m_arsLags[if_name] = *arsObject_entry;
-
-            m_arsLagStateTable->set(if_name, fvVector);
-
-            SWSS_LOG_NOTICE("ARS Adding LAG %s", if_name.c_str());
+            SWSS_LOG_NOTICE("ARS NHG added: VRF %s, Nexthop %s, ARS Obj %s, Role %s",
+                            vrf_name.c_str(), nexthop_ip.to_string().c_str(),
+                            ars_obj_name.c_str(), role.c_str());
         }
         else if (op == DEL_COMMAND)
         {
-            if (m_arsLags.find(if_name) == m_arsLags.end())
+            auto itr = m_arsNexthops.find(nexthop_key);
+
+            if (itr == m_arsNexthops.end())
             {
-                SWSS_LOG_INFO("Received delete call for non-existent interface %s", if_name.c_str());
+                SWSS_LOG_NOTICE("ARS NHG entry does not exist for VRF %s, Nexthop %s, ignoring delete",
+                                vrf_name.c_str(), nexthop_ip.to_string().c_str());
                 it = consumer.m_toSync.erase(it);
                 continue;
             }
-            else if (!isSetImplemented(SAI_OBJECT_TYPE_LAG, SAI_LAG_ATTR_ARS_OBJECT_ID))
-            {
-                SWSS_LOG_NOTICE("Disabling ARS LAG is not supported");
-                it = consumer.m_toSync.erase(it);
-                continue;
-            }
-            else
-            {
-                arsObject_entry = &m_arsLags[if_name];
-                if (arsObject_entry->ars_object_id)
-                {
-                    /* remove ars sai object */
-                    delArsObject(arsObject_entry);
-                }
-                m_arsLags.erase(if_name);
-                auto arsProfile_entry = m_arsProfiles.find(arsObject_entry->profile_name);
-                if (arsProfile_entry == m_arsProfiles.end())
-                {
-                    SWSS_LOG_ERROR("Received ARS LAG %s for non-existent profile %s", if_name.c_str(), arsObject_entry->profile_name.c_str());
-                }
-                else
-                {
-                    arsProfile_entry->second.ref_count--;
-                }
-                m_arsLagStateTable->del(if_name);
-                SWSS_LOG_INFO("Removed interface %s", if_name.c_str());
-            }
+
+            ArsNexthopEntry &ars_nexthop = itr->second;
+
+            // Remove from internal map
+            m_arsNexthops.erase(itr);
+
+            SWSS_LOG_NOTICE("ARS NHG removed: VRF %s, Nexthop %s, ARS Obj %s, Role %s",
+                            vrf_name.c_str(), nexthop_ip.to_string().c_str(),
+                            ars_nexthop.ars_obj_name.c_str(), ars_nexthop.role.c_str());
         }
 
-        if (!gPortsOrch->getPort(if_name, p) || (p.m_lag_id == SAI_NULL_OBJECT_ID))
-        {
-            SWSS_LOG_WARN("Tried to %s non-existent interface %s - skipped", op.c_str(), if_name.c_str());
-        }
-        else
-        {
-            sai_attribute_t attr;
-            attr.id = SAI_LAG_ATTR_ARS_OBJECT_ID;
-            attr.value.oid = (op == SET_COMMAND)  ? arsObject_entry->ars_object_id : SAI_NULL_OBJECT_ID;
-            sai_status_t status = sai_lag_api->set_lag_attribute(p.m_lag_id, &attr);
-            if (status != SAI_STATUS_SUCCESS)
-            {
-                SWSS_LOG_ERROR("Failed to set ars object %" PRIx64 " to lag: %s", attr.value.oid, p.m_alias.c_str());
-            }
-            else 
-            {
-                addLagToFlexCounter(p.m_lag_id, p.m_alias);
-            }
-        }
-
+        // Move iterator after processing
         it = consumer.m_toSync.erase(it);
     }
 
     return true;
 }
-
 void ArsOrch::doTask(Consumer& consumer) 
 {
     SWSS_LOG_ENTER();
@@ -1361,208 +1834,24 @@ void ArsOrch::doTask(Consumer& consumer)
         return;
     }
 
-	if (table_name == CFG_ARS_PROFILE || table_name == APP_ARS_PROFILE_TABLE_NAME)
+	if (table_name == CFG_ARS_PROFILE_TABLE_NAME)
     {
         doTaskArsProfile(consumer);
     }
-    else if (table_name == CFG_ARS_INTERFACE || table_name == APP_ARS_INTERFACE_TABLE_NAME)
+    else if (table_name == CFG_ARS_INTERFACE_TABLE_NAME)
     {
         doTaskArsInterfaces(consumer);
     }
-    else if (table_name == CFG_ARS_NEXTHOP_GROUP || table_name == APP_ARS_NEXTHOP_GROUP_TABLE_NAME)
+    else if (table_name == CFG_ARS_OBJECT_TABLE_NAME)
     {
-        doTaskArsNexthopGroup(consumer);
+        doTaskArsObject(consumer);
     }
-    else if (table_name == CFG_ARS_PORTCHANNEL || table_name == APP_ARS_PORTCHANNEL_TABLE_NAME)
+    else if (table_name == CFG_ARS_NEXTHOP_TABLE_NAME)
     {
-        doTaskArsLag(consumer);
+        doTaskArsNexthop(consumer);
     }
     else
     {
         SWSS_LOG_ERROR("Unknown table : %s", table_name.c_str());
-    }
-}
-#if 0
-string ArsOrch::getLagFlexCounterTableKey(string key)
-{
-    return string(ARS_LAG_FLEX_COUNTER_GROUP) + ":" + key;
-}
-
-string ArsOrch::getNhgFlexCounterTableKey(string key)
-{
-    return string(ARS_NEXTHOP_GROUP_FLEX_COUNTER_GROUP) + ":" + key;
-}
-#endif
-std::unordered_set<std::string> ArsOrch::generateLagCounterStats()
-{
-    std::unordered_set<std::string> counter_stats;
-    for (const auto& it: lag_counter_stat_ids)
-    {
-        if (isGetImplemented(SAI_OBJECT_TYPE_LAG, it.first))
-        {
-            counter_stats.emplace(it.second);
-        }
-    }
-    return counter_stats;
-}
-
-std::unordered_set<std::string> ArsOrch::generateNhgCounterStats()
-{
-    std::unordered_set<std::string> counter_stats;
-    for (const auto& it: nhg_counter_stat_ids)
-    {
-        if (isGetImplemented(SAI_OBJECT_TYPE_NEXT_HOP_GROUP, it.first))
-        {
-            counter_stats.emplace(it.second);
-        }
-    }
-    return counter_stats;
-}
-
-void ArsOrch::generateLagCounterMap()
-{
-    if (m_isLagCounterMapGenerated)
-    {
-        return;
-    }
-
-    if (m_LagFlexCounterUpdTimer)
-    {
-        m_LagFlexCounterUpdTimer->start();
-        m_isLagCounterMapGenerated = true;
-    }
-}
-
-void ArsOrch::generateNexthopGroupCounterMap()
-{
-    if (m_isNhgCounterMapGenerated)
-    {
-        return;
-    }
-
-    if (m_NhgFlexCounterUpdTimer)
-    {
-        m_NhgFlexCounterUpdTimer->start();
-        m_isNhgCounterMapGenerated = true;
-    }
-}
-
-void ArsOrch::addLagToFlexCounter(sai_object_id_t oid, const string &name)
-{
-    m_pendingLagAddToFlexCntr[oid] = name;
-}
-
-void ArsOrch::addNhgToFlexCounter(sai_object_id_t oid, const IpPrefix &prefix, const string &vrf)
-{
-    m_pendingNhgAddToFlexCntr[oid] = prefix.to_string() + ":" + vrf;
-}
-
-void ArsOrch::removeLagFromFlexCounter(sai_object_id_t id, const string &name)
-{
-    SWSS_LOG_ENTER();
-
-    std::string counter_oid_str;
-    counter_oid_str = sai_serialize_object_id(id);
-
-    auto update_iter = m_pendingLagAddToFlexCntr.find(id);
-    if (update_iter == m_pendingLagAddToFlexCntr.end())
-    {
-        m_lag_counter_manager.clearCounterIdList(id);
-    }
-    else
-    {
-        m_pendingLagAddToFlexCntr.erase(update_iter);
-    }
-
-    /* remove it from COUNTERS_DB maps */
-    m_lag_counter_table->hdel("", name);
-    m_vidToRidTable->hdel("", counter_oid_str);
-
-    SWSS_LOG_DEBUG("Unregistered interface %s from Flex counter", name.c_str());
-}
-
-void ArsOrch::removeNhgFromFlexCounter(sai_object_id_t id, const IpPrefix &prefix, const string &vrf)
-{
-    SWSS_LOG_ENTER();
-
-    std::string counter_oid_str;
-    counter_oid_str = sai_serialize_object_id(id);
-
-    auto update_iter = m_pendingNhgAddToFlexCntr.find(id);
-    if (update_iter == m_pendingNhgAddToFlexCntr.end())
-    {
-        m_nhg_counter_manager.clearCounterIdList(id);
-    }
-    else
-    {
-        m_pendingNhgAddToFlexCntr.erase(update_iter);
-    }
-
-    /* remove it from COUNTERS_DB maps */
-    auto name = prefix.to_string() + ":" + vrf;
-    m_nhg_counter_table->hdel("", name);
-    m_vidToRidTable->hdel("", counter_oid_str);
-
-    SWSS_LOG_DEBUG("Unregistered nhg %s from Flex counter", name.c_str());
-}
-
-void ArsOrch::doTask(SelectableTimer &timer)
-{
-    string value;
-
-    if (!m_isArsSupported)
-    {
-        SWSS_LOG_INFO("ARS is not supported");
-        return;
-    }
-
-    if (timer.getFd() == m_LagFlexCounterUpdTimer->getFd())
-    {
-        for (auto it = m_pendingLagAddToFlexCntr.begin(); it != m_pendingLagAddToFlexCntr.end(); )
-        {
-            const auto id = sai_serialize_object_id(it->first);
-            if (!gTraditionalFlexCounter || m_vidToRidTable->hget("", id, value))
-            {
-                vector<FieldValueTuple> lagNameVector;
-
-                lagNameVector.emplace_back(it->second.c_str(), id);
-                m_lag_counter_table->set("", lagNameVector);
-                m_counter_db->hset(COUNTERS_ARS_LAG_NAME_MAP, it->second.c_str(), id.c_str());
-
-                auto lag_counter_stats = generateLagCounterStats();
-                m_lag_counter_manager.setCounterIdList(it->first, CounterType::ARS_LAG, lag_counter_stats, gSwitchId);
-                SWSS_LOG_DEBUG("inserted %s to flex counter", it->second.c_str());
-                it = m_pendingLagAddToFlexCntr.erase(it);
-            }
-            else
-            {
-                ++it;
-            }
-        }
-    }
-
-    if (timer.getFd() == m_NhgFlexCounterUpdTimer->getFd())
-    {
-        for (auto it = m_pendingNhgAddToFlexCntr.begin(); it != m_pendingNhgAddToFlexCntr.end(); )
-        {
-            const auto id = sai_serialize_object_id(it->first);
-            if (!gTraditionalFlexCounter || m_vidToRidTable->hget("", id, value))
-            {
-                vector<FieldValueTuple> nhgNameVector;
-
-                nhgNameVector.emplace_back(it->second.c_str(), id);
-                m_nhg_counter_table->set("", nhgNameVector);
-                m_counter_db->hset(COUNTERS_ARS_NEXTHOP_GROUP_NAME_MAP, it->second.c_str(), id.c_str());
-
-                auto nhg_counter_stats = generateNhgCounterStats();
-                m_nhg_counter_manager.setCounterIdList(it->first, CounterType::ARS_NEXTHOP_GROUP, nhg_counter_stats, gSwitchId);
-                SWSS_LOG_DEBUG("inserted %s to flex counter", it->second.c_str());
-                it = m_pendingNhgAddToFlexCntr.erase(it);
-            }
-            else
-            {
-                ++it;
-            }
-        }
     }
 }
