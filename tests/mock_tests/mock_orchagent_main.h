@@ -37,6 +37,7 @@
 #define private public
 #include "stporch.h"
 #undef private 
+#include "arsorch.h"
 #include "directory.h"
 #include "dashvnetorch.h"
 #include "dashhaorch.h"
