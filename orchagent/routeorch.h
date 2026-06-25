@@ -8,6 +8,7 @@
 #include "neighorch.h"
 #include "vxlanorch.h"
 #include "srv6orch.h"
+#include "arsorch.h"
 
 #include "ipaddress.h"
 #include "ipaddresses.h"
@@ -27,6 +28,7 @@
 
 #define LOOPBACK_PREFIX     "Loopback"
 #define VLAN_PREFIX         "Vlan"
+
 
 struct NextHopGroupMemberEntry
 {
@@ -83,12 +85,21 @@ struct RouteNhg
 
     std::string context_index;
 
+    /*
+     * When a route is using a temporary single next hop (because the desired
+     * NHG could not be created), this records the original desired NHG key.
+     * Used to detect NHG membership changes and allow re-randomization.
+     */
+    NextHopGroupKey desired_nhg_key;
+
     RouteNhg() = default;
     RouteNhg(const NextHopGroupKey& key, const std::string& index, const std::string &context_index = "") :
         nhg_key(key), nhg_index(index), context_index(context_index) {}
 
     bool operator==(const RouteNhg& rnhg)
        { return ((nhg_key == rnhg.nhg_key) && (nhg_index == rnhg.nhg_index) && (context_index == rnhg.context_index)); }
+    bool operator==(const NextHopGroupKey& other_key) 
+        { return nhg_key == other_key; }
     bool operator!=(const RouteNhg& rnhg) { return !(*this == rnhg); }
 };
 
@@ -120,8 +131,12 @@ typedef std::map<sai_object_id_t, LabelRouteTable> LabelRouteTables;
 typedef std::pair<sai_object_id_t, IpAddress> Host;
 /* NextHopObserverTable: Host, next hop observer entry */
 typedef std::map<Host, NextHopObserverEntry> NextHopObserverTable;
+/* Prefix: vrf_id, IpPrefix */
+typedef std::pair<sai_object_id_t, IpPrefix> Prefix;
 /* Single Nexthop to Routemap */
 typedef std::map<NextHopKey, std::set<RouteKey>> NextHopRouteTable;
+/* NexthopGroup set */
+typedef std::vector<RouteNhg> NhgTable;
 
 struct NextHopObserverEntry
 {
@@ -152,9 +167,11 @@ struct RouteBulkContext
     std::string                         protocol;  // Protocol string
     bool                                is_set;    // True if set operation
 
+    Constraint                          retry_cst;
+
     RouteBulkContext(const std::string& key, bool is_set)
         : key(key), excp_intfs_flag(false), using_temp_nhg(false), is_set(is_set),
-          fallback_to_default_route(false)
+          fallback_to_default_route(false), retry_cst(DUMMY_CONSTRAINT)
     {
     }
 
@@ -174,6 +191,7 @@ struct RouteBulkContext
         key.clear();
         protocol.clear();
         fallback_to_default_route = false;
+        retry_cst = DUMMY_CONSTRAINT;
     }
 };
 
@@ -209,10 +227,10 @@ struct LabelRouteBulkContext
     }
 };
 
-class RouteOrch : public ZmqOrch, public Subject
+class RouteOrch : public ZmqRouteOrch, public Subject
 {
 public:
-    RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch, FgNhgOrch *fgNhgOrch, Srv6Orch *srv6Orch, swss::ZmqServer *zmqServer = nullptr);
+    RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch, FgNhgOrch *fgNhgOrch, Srv6Orch *srv6Orch, ArsOrch *arsOrch, swss::ZmqServer *zmqServer = nullptr);
 
     bool hasNextHopGroup(const NextHopGroupKey&) const;
     sai_object_id_t getNextHopGroupId(const NextHopGroupKey&);
@@ -228,7 +246,8 @@ public:
     int getNextHopGroupRefCount(const NextHopGroupKey& key) { return m_syncdNextHopGroups[key].ref_count; }
     std::set<std::pair<NextHopGroupKey, sai_object_id_t>> &getBulkNhgReducedRefCnt() { return m_bulkNhgReducedRefCnt; }
 
-    bool addNextHopGroup(const NextHopGroupKey&);
+    bool addNextHopGroup(const NextHopGroupKey&, sai_object_id_t vrf_id = gVirtualRouterId);
+    bool addNextHopGroup(const NextHopGroupKey&, std::vector<sai_attribute_t> &nhg_attrs, sai_object_id_t vrf_id = gVirtualRouterId);
     bool removeNextHopGroup(const NextHopGroupKey&, const bool is_default_route_nh_swap=false);
 
     bool addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops);
@@ -253,12 +272,13 @@ public:
     const NextHopGroupKey getSyncdRouteNhgKey(sai_object_id_t vrf_id, const IpPrefix& ipPrefix);
     bool createFineGrainedNextHopGroup(sai_object_id_t &next_hop_group_id, vector<sai_attribute_t> &nhg_attrs);
     bool removeFineGrainedNextHopGroup(sai_object_id_t &next_hop_group_id);
-    bool isRouteExists(const IpPrefix& prefix);
+    bool isRouteExists(sai_object_id_t vrf_id, const IpPrefix& prefix);
     bool removeRoutePrefix(const IpPrefix& prefix);
 
     void addLinkLocalRouteToMe(sai_object_id_t vrf_id, IpPrefix linklocal_prefix);
     void delLinkLocalRouteToMe(sai_object_id_t vrf_id, IpPrefix linklocal_prefix);
     std::string getLinkLocalEui64Addr(void);
+    std::string getLinkLocalEui64Addr(const MacAddress &mac);
 
     unsigned int getNhgCount() { return m_nextHopGroupCount; }
     unsigned int getMaxNhgCount() { return m_maxNextHopGroupCount; }
@@ -275,6 +295,7 @@ private:
     VRFOrch *m_vrfOrch;
     FgNhgOrch *m_fgNhgOrch;
     Srv6Orch *m_srv6Orch;
+    ArsOrch *m_arsOrch;
 
     unsigned int m_nextHopGroupCount;
     unsigned int m_maxNextHopGroupCount;

@@ -10,6 +10,7 @@ sai_object_id_t gVirtualRouterId;
 sai_object_id_t gUnderlayIfId;
 sai_object_id_t gSwitchId = SAI_NULL_OBJECT_ID;
 MacAddress gMacAddress;
+MacAddress gSagMacAddress;
 MacAddress gVxlanMacAddress;
 
 string gMySwitchType = "switch";
@@ -24,3 +25,9 @@ sai_redis_communication_mode_t gRedisCommunicationMode = SAI_REDIS_COMMUNICATION
 VRFOrch *gVrfOrch;
 
 void syncd_apply_view() {}
+
+bool gMultiAsicVoq = false;
+bool isChassisDbInUse()
+{
+    return gMultiAsicVoq;
+}

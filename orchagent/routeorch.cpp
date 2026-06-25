@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <time.h>
+#include <random>
 #include <inttypes.h>
 #include <algorithm>
 #include "routeorch.h"
@@ -13,6 +14,7 @@
 #include "swssnet.h"
 #include "crmorch.h"
 #include "directory.h"
+#include "arsorch.h"
 
 extern sai_object_id_t gVirtualRouterId;
 extern sai_object_id_t gSwitchId;
@@ -37,11 +39,11 @@ extern string gMySwitchType;
 #define DEFAULT_NUMBER_OF_ECMP_GROUPS   128
 #define DEFAULT_MAX_ECMP_GROUP_SIZE     32
 
-RouteOrch::RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch, FgNhgOrch *fgNhgOrch, Srv6Orch *srv6Orch, swss::ZmqServer *zmqServer) :
+RouteOrch::RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames, SwitchOrch *switchOrch, NeighOrch *neighOrch, IntfsOrch *intfsOrch, VRFOrch *vrfOrch, FgNhgOrch *fgNhgOrch, Srv6Orch *srv6Orch, ArsOrch *arsOrch, swss::ZmqServer *zmqServer) :
         gRouteBulker(sai_route_api, gMaxBulkSize),
         gLabelRouteBulker(sai_mpls_api, gMaxBulkSize),
         gNextHopGroupMemberBulker(sai_next_hop_group_api, gSwitchId, gMaxBulkSize),
-        ZmqOrch(db, tableNames, zmqServer),
+        ZmqRouteOrch(db, tableNames, zmqServer),
         m_switchOrch(switchOrch),
         m_neighOrch(neighOrch),
         m_intfsOrch(intfsOrch),
@@ -49,12 +51,14 @@ RouteOrch::RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames,
         m_fgNhgOrch(fgNhgOrch),
         m_nextHopGroupCount(0),
         m_srv6Orch(srv6Orch),
+        m_arsOrch(arsOrch),
         m_resync(false),
         m_appTunnelDecapTermProducer(db, APP_TUNNEL_DECAP_TERM_TABLE_NAME)
 {
     SWSS_LOG_ENTER();
 
     m_publisher.setBuffered(true);
+    m_publisher.m_directDbWrite = true;
 
     sai_attribute_t attr;
     attr.id = SAI_SWITCH_ATTR_NUMBER_OF_ECMP_GROUPS;
@@ -90,6 +94,12 @@ RouteOrch::RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames,
     m_switchOrch->set_switch_capability(fvTuple);
 
     SWSS_LOG_NOTICE("Maximum number of ECMP groups supported is %d", m_maxNextHopGroupCount);
+
+    if (m_maxNextHopGroupCount < DEFAULT_MAX_ECMP_GROUP_SIZE)
+    {
+        SWSS_LOG_WARN("SAI MAX ECMP group count is less than expected default: %d (expected >= %d).",
+                      m_maxNextHopGroupCount, DEFAULT_MAX_ECMP_GROUP_SIZE);
+    }
 
     /* fetch the MAX_ECMP_MEMBER_COUNT and for voq platform, set it to 128 */
     attr.id = SAI_SWITCH_ATTR_MAX_ECMP_MEMBER_COUNT;
@@ -187,14 +197,21 @@ RouteOrch::RouteOrch(DBConnector *db, vector<table_name_with_pri_t> &tableNames,
 
     addLinkLocalRouteToMe(gVirtualRouterId, default_link_local_prefix);
     SWSS_LOG_NOTICE("Created link local ipv6 route %s to cpu", default_link_local_prefix.to_string().c_str());
+
+    createRetryCache(APP_ROUTE_TABLE_NAME);
 }
 
 std::string RouteOrch::getLinkLocalEui64Addr(void)
 {
+    return getLinkLocalEui64Addr(gMacAddress);
+}
+
+std::string RouteOrch::getLinkLocalEui64Addr(const MacAddress &mac)
+{
     SWSS_LOG_ENTER();
 
     string        ip_prefix;
-    const uint8_t *gmac = gMacAddress.getMac();
+    const uint8_t *gmac = mac.getMac();
 
     uint8_t        eui64_interface_id[EUI64_INTF_ID_LEN];
     char           ipv6_ll_addr[INET6_ADDRSTRLEN] = {0};
@@ -898,7 +915,7 @@ void RouteOrch::doTask(ConsumerBase& consumer)
                         * way is to create loopback interface and then create
                         * route pointing to it, so that we can traps packets to
                         * CPU */
-                        if (alias == "eth0" || alias == "docker0" ||
+                        if (alias == "eth0" || alias == "docker0" || alias == "usb0" ||
                             alias == "lo" || !alias.compare(0, strlen(LOOPBACK_PREFIX), LOOPBACK_PREFIX))
                         {
                             excp_intfs_flag = true;
@@ -1051,7 +1068,9 @@ void RouteOrch::doTask(ConsumerBase& consumer)
                     else
                     {
                         if (addRoute(ctx, nhg))
+                        {
                             it = consumer.m_toSync.erase(it);
+                        }
                         else
                             it++;
                     }
@@ -1072,7 +1091,9 @@ void RouteOrch::doTask(ConsumerBase& consumer)
                     ctx.using_temp_nhg)
                 {
                     if (addRoute(ctx, nhg))
+                    {
                         it = consumer.m_toSync.erase(it);
+                    }
                     else
                         it++;
                 }
@@ -1130,10 +1151,22 @@ void RouteOrch::doTask(ConsumerBase& consumer)
             }
 
             const auto& ctx = found->second;
+
+            // if retry_cst field is set, move this task to retry cache:
+            // - add it to retry cache before executing addRoutePost/removeRoutePost
+            //      - since these functions could modify retrycache status
+            // - delete it from m_toSync after addRoutePost/removeRoutePost to avoid duplicates
+            bool rc_inserted = false;
+            if (ctx.retry_cst != DUMMY_CONSTRAINT)
+                rc_inserted = consumer.addToRetry(it_prev->second, ctx.retry_cst);
+
             const auto& object_statuses = ctx.object_statuses;
             if (object_statuses.empty())
             {
-                it_prev++;
+                if (rc_inserted)
+                    it_prev = consumer.m_toSync.erase(it_prev);
+                else
+                    it_prev++;
                 continue;
             }
 
@@ -1153,7 +1186,7 @@ void RouteOrch::doTask(ConsumerBase& consumer)
                 {
                     /* If any existing routes are updated to point to the
                      * above interfaces, remove them from the ASIC. */
-                    if (removeRoutePost(ctx))
+                    if (removeRoutePost(ctx) || rc_inserted)
                         it_prev = consumer.m_toSync.erase(it_prev);
                     else
                         it_prev++;
@@ -1164,7 +1197,7 @@ void RouteOrch::doTask(ConsumerBase& consumer)
 
                 if (nhg.getSize() == 1 && nhg.hasIntfNextHop())
                 {
-                    if (addRoutePost(ctx, nhg))
+                    if (addRoutePost(ctx, nhg) || rc_inserted)
                         it_prev = consumer.m_toSync.erase(it_prev);
                     else
                         it_prev++;
@@ -1175,7 +1208,7 @@ void RouteOrch::doTask(ConsumerBase& consumer)
                          gRouteBulker.bulk_entry_pending_removal(route_entry) ||
                          ctx.using_temp_nhg)
                 {
-                    if (addRoutePost(ctx, nhg))
+                    if (addRoutePost(ctx, nhg) || rc_inserted)
                         it_prev = consumer.m_toSync.erase(it_prev);
                     else
                         it_prev++;
@@ -1198,12 +1231,18 @@ void RouteOrch::doTask(ConsumerBase& consumer)
             else if (op == DEL_COMMAND)
             {
                 /* Cannot locate the route or remove succeed */
-                if (removeRoutePost(ctx))
+                if (removeRoutePost(ctx) || rc_inserted)
                     it_prev = consumer.m_toSync.erase(it_prev);
                 else
                     it_prev++;
             }
         }
+
+        /* Flush response publisher so route notifications reach fpmsyncd every batch.
+         * Without this, notifications stay buffered in the Redis pipeline until the
+         * next OrchDaemon periodic flush (up to 1s), delaying the offload reply to
+         * zebra and causing BGP advertisement delay when supress fib pending is ON */
+        m_publisher.flush();
 
         /* Remove next hop group if the reference count decreases to zero */
         for (auto& it_nhg : m_bulkNhgReducedRefCnt)
@@ -1398,8 +1437,9 @@ bool RouteOrch::createFineGrainedNextHopGroup(sai_object_id_t &next_hop_group_id
 
     if (m_nextHopGroupCount + NhgOrch::getSyncedNhgCount() >= m_maxNextHopGroupCount)
     {
-        SWSS_LOG_DEBUG("Failed to create new next hop group. \
-                Reaching maximum number of next hop groups.");
+        SWSS_LOG_INFO("Failed to create new next hop group. "
+                      "Reaching maximum number of next hop groups (%d).",
+                      m_maxNextHopGroupCount);
         return false;
     }
 
@@ -1441,21 +1481,40 @@ bool RouteOrch::removeFineGrainedNextHopGroup(sai_object_id_t &next_hop_group_id
 
     gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_NEXTHOP_GROUP);
     m_nextHopGroupCount--;
-
     return true;
 }
 
-bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
+bool RouteOrch::addNextHopGroup(const NextHopGroupKey& nexthops, vector<sai_attribute_t> &nhg_attrs, sai_object_id_t vrf_id)
 {
     SWSS_LOG_ENTER();
-
+    sai_attribute_t nhg_attr;
+    sai_object_id_t ars_obj_id;
     assert(!hasNextHopGroup(nexthops));
-
+ 
     if (m_nextHopGroupCount + NhgOrch::getSyncedNhgCount() >= m_maxNextHopGroupCount)
     {
-        SWSS_LOG_DEBUG("Failed to create new next hop group. \
-                        Reaching maximum number of next hop groups.");
+        SWSS_LOG_INFO("Failed to create new next hop group. "
+                      "Reaching maximum number of next hop groups (%d).",
+                      m_maxNextHopGroupCount);
         return false;
+    }
+
+    bool is_ars_enabled = false;
+    bool is_ars_object_found = false;
+    bool is_nexthop_ars_capable = false;
+
+    is_ars_enabled = m_arsOrch->isArsProfileEnabled();
+    if (is_ars_enabled)
+    {
+       is_ars_object_found = m_arsOrch->validateNexthopsForArs(vrf_id, nexthops, ars_obj_id);
+       /* set nexthop is ars capable only when ARS criteria are met */
+       if (is_ars_object_found)
+       {
+           is_nexthop_ars_capable = true;
+           nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID;
+           nhg_attr.value.oid = ars_obj_id;
+           nhg_attrs.push_back(nhg_attr);
+       }
     }
 
     vector<sai_object_id_t> next_hop_ids;
@@ -1465,6 +1524,7 @@ bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
     std::map<sai_object_id_t, set<NextHopKey>> nhopgroup_shared_set;
     MuxOrch* mux_orch = gDirectory.get<MuxOrch*>();
     sai_object_id_t mux_tunnel_nh_id = mux_orch->getTunnelNextHopId();
+    bool has_mux_prefix_rt_nh = mux_orch->hasPrefixBasedMuxNexthop(next_hop_set);
 
     /* Assert each IP address exists in m_syncdNextHops table,
      * and add the corresponding next_hop_id to next_hop_ids. */
@@ -1496,6 +1556,12 @@ bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
         {
             valid_next_hops_for_refcount.insert(it);
         }
+        else if (has_mux_prefix_rt_nh)
+        {
+            // skip using tunnel nh in NHG for prefix based mux nbrs
+            SWSS_LOG_INFO("Skipping tunnel nh in NHG %s", nexthops.to_string().c_str());
+            continue;
+        }
 
         // skip next hop group member create for neighbor from down port
         if (m_neighOrch->isNextHopFlagSet(it, NHFLAGS_IFDOWN))
@@ -1519,27 +1585,49 @@ bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
         SWSS_LOG_INFO("Skipping creation of nexthop group as none of nexthop are active");
         return false;
     }
-    sai_attribute_t nhg_attr;
-    vector<sai_attribute_t> nhg_attrs;
-
-    nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
-    nhg_attr.value.s32 = m_switchOrch->checkOrderedEcmpEnable() ? SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_ORDERED_ECMP : SAI_NEXT_HOP_GROUP_TYPE_ECMP;
-    nhg_attrs.push_back(nhg_attr);
 
     sai_object_id_t next_hop_group_id;
     sai_status_t status = sai_next_hop_group_api->create_next_hop_group(&next_hop_group_id,
                                                                         gSwitchId,
                                                                         (uint32_t)nhg_attrs.size(),
                                                                         nhg_attrs.data());
-
     if (status != SAI_STATUS_SUCCESS)
     {
-        SWSS_LOG_ERROR("Failed to create next hop group %s, rv:%d",
-                       nexthops.to_string().c_str(), status);
-        task_process_status handle_status = handleSaiCreateStatus(SAI_API_NEXT_HOP_GROUP, status);
-        if (handle_status != task_success)
+        if (is_nexthop_ars_capable)
         {
-            return parseHandleSaiStatusFailure(handle_status);
+            SWSS_LOG_NOTICE("Trying to create nexthop group without ARS %s, rv:%d",
+                       nexthops.to_string().c_str(), status);
+            std::vector<sai_attribute_t> nhg_attrs_no_ars;
+            for (const auto &attr : nhg_attrs)
+            {
+                if (attr.id != SAI_NEXT_HOP_GROUP_ATTR_ARS_OBJECT_ID)
+                    nhg_attrs_no_ars.push_back(attr);
+            }
+            sai_status_t status = sai_next_hop_group_api->create_next_hop_group(&next_hop_group_id,
+                                                                        gSwitchId,
+                                                                        (uint32_t)nhg_attrs_no_ars.size(),
+                                                                        nhg_attrs_no_ars.data());
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("Failed to create next hop group (without ARS) %s, rv:%d",
+                           nexthops.to_string().c_str(), status);
+                task_process_status handle_status = handleSaiCreateStatus(SAI_API_NEXT_HOP_GROUP, status);
+                if (handle_status != task_success)
+                {
+                    return parseHandleSaiStatusFailure(handle_status);
+                }
+
+            }
+        }
+        else 
+        {
+            SWSS_LOG_ERROR("Failed to create next hop group %s, rv:%d",
+                       nexthops.to_string().c_str(), status);
+            task_process_status handle_status = handleSaiCreateStatus(SAI_API_NEXT_HOP_GROUP, status);
+            if (handle_status != task_success)
+            {
+                return parseHandleSaiStatusFailure(handle_status);
+            }
         }
     }
 
@@ -1550,7 +1638,6 @@ bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
 
     NextHopGroupEntry next_hop_group_entry;
     next_hop_group_entry.next_hop_group_id = next_hop_group_id;
-    next_hop_group_entry.nh_member_install_count = 0;
 
     size_t npid_count = next_hop_ids.size();
     vector<sai_object_id_t> nhgm_ids(npid_count);
@@ -1621,16 +1708,12 @@ bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
         {
             next_hop_group_entry.nhopgroup_members[nhopgroup_members_set.find(nhid)->second].next_hop_id = nhgm_id;
             next_hop_group_entry.nhopgroup_members[nhopgroup_members_set.find(nhid)->second].seq_id = ((uint32_t)i) + 1;
-            /* Keep the count of number of nexthop members are present in Nexthop Group*/
-            next_hop_group_entry.nh_member_install_count++;
         }
     }
 
-    /* Increment the ref_count for the valid next hops used by the next hop group. */
-    for (auto it : valid_next_hops_for_refcount)
-    {
+    /* Increment the ref_count for the next hops used by the next hop group. */
+    for (auto it : next_hop_set)
         m_neighOrch->increaseNextHopRefCount(it);
-    }
 
     /*
      * Initialize the next hop group structure with ref_count as 0. This
@@ -1640,6 +1723,18 @@ bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nexthops)
     m_syncdNextHopGroups[nexthops] = next_hop_group_entry;
 
     return true;
+}
+
+bool RouteOrch::addNextHopGroup(const NextHopGroupKey &nextHops, sai_object_id_t vrf_id)
+{
+    sai_attribute_t nhg_attr;
+    vector<sai_attribute_t> nhg_attrs;
+
+    nhg_attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+    nhg_attr.value.s32 = m_switchOrch->checkOrderedEcmpEnable() ? SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_ORDERED_ECMP : SAI_NEXT_HOP_GROUP_TYPE_ECMP;
+    nhg_attrs.push_back(nhg_attr);
+
+    return addNextHopGroup(nextHops, nhg_attrs, vrf_id);
 }
 
 bool RouteOrch::removeNextHopGroup(const NextHopGroupKey &nexthops, const bool is_default_route_nh_swap)
@@ -1675,6 +1770,15 @@ bool RouteOrch::removeNextHopGroup(const NextHopGroupKey &nexthops, const bool i
         {
             SWSS_LOG_WARN("NHFLAGS_IFDOWN set for next hop group member %s with next_hop_id %" PRIx64,
                            nhop->first.to_string().c_str(), nhop->second.next_hop_id);
+            nhop = nhgm.erase(nhop);
+            continue;
+        }
+
+        if (m_neighOrch->isPrefixNeighborNh(nhop->first) && !m_neighOrch->hasNextHop(nhop->first))
+        {
+            SWSS_LOG_INFO("Skip NHG member remove for %s in group %" PRIx64 ": nexthop missing",
+                          nhop->first.to_string().c_str(),
+                          next_hop_group_entry->second.next_hop_group_id);
             nhop = nhgm.erase(nhop);
             continue;
         }
@@ -1940,9 +2044,11 @@ void RouteOrch::addTempRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextH
     if (next_hop_set.empty())
         return;
 
-    /* Randomly pick an address from the set */
+    /* Randomly pick an address from the set using a robust RNG */
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<size_t> dist(0, next_hop_set.size() - 1);
     auto it = next_hop_set.begin();
-    advance(it, rand() % next_hop_set.size());
+    std::advance(it, dist(rng));
 
     /* Set the route's temporary next hop to be the randomly picked one */
     NextHopGroupKey tmp_next_hop((*it).to_string());
@@ -2010,6 +2116,12 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
         catch(const std::out_of_range& e)
         {
             SWSS_LOG_INFO("Next hop group key %s does not exist", ctx.nhg_index.c_str());
+            return false;
+        }
+        if (!ctx.context_index.empty() && !m_srv6Orch->contextIdExists(ctx.context_index))
+        {
+            SWSS_LOG_INFO("Context ID %s does not exist, move task entry to RetryCache", ctx.context_index.c_str());
+            ctx.retry_cst = make_constraint(RETRY_CST_PIC, ctx.context_index);
             return false;
         }
     }
@@ -2126,12 +2238,11 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
                 return false;
             }
         }
-
         /* Check if there is already an existing next hop group */
         if (!hasNextHopGroup(nextHops))
         {
             /* Try to create a new next hop group */
-            if (!addNextHopGroup(nextHops))
+            if (!addNextHopGroup(nextHops, vrf_id))
             {
                 /* If the nexthop is a srv6 nexthop, not create tempRoute
                  * retry to add route */
@@ -2177,12 +2288,15 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
 
                 /* Failed to create the next hop group and check if a temporary route is needed */
 
-                /* If the current next hop is part of the next hop group to sync,
-                 * then return false and no need to add another temporary route. */
+                /* If the current next hop is part of the next hop group to sync
+                 * and the desired NHG hasn't changed, skip re-randomization to
+                 * avoid unnecessary dataplane churn. Re-randomize if the NHG
+                 * membership changed (e.g., new nexthops came up). */
                 if (it_route != m_syncdRoutes.at(vrf_id).end() && it_route->second.nhg_key.getSize() == 1)
                 {
                     const NextHopKey& nexthop = *it_route->second.nhg_key.getNextHops().begin();
-                    if (nextHops.contains(nexthop))
+                    if (nextHops.contains(nexthop) &&
+                        it_route->second.desired_nhg_key == nextHops)
                     {
                         return false;
                     }
@@ -2190,7 +2304,8 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
 
                 /* Add a temporary route when a next hop group cannot be added,
                  * and there is no temporary route right now or the current temporary
-                 * route is not pointing to a member of the next hop group to sync. */
+                 * route is not pointing to a member of the next hop group to sync,
+                 * or the desired NHG membership has changed. */
                 addTempRoute(ctx, nextHops);
                 /* Return false since the original route is not successfully added */
                 return false;
@@ -2245,11 +2360,6 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
 
         if (!ctx.context_index.empty() || nextHops.is_srv6_vpn())
         {
-            if (!ctx.context_index.empty() && !m_srv6Orch->contextIdExists(ctx.context_index))
-            {
-                SWSS_LOG_INFO("Context id %s does not exist", ctx.context_index.c_str());
-                return false;
-            }
             route_attr.id = SAI_ROUTE_ENTRY_ATTR_PREFIX_AGG_ID;
             route_attr.value.u32 = ctx.nhg_index.empty() ? m_srv6Orch->getAggId(nextHops) : m_srv6Orch->getAggId(ctx.context_index);
             route_attrs.push_back(route_attr);
@@ -2304,15 +2414,9 @@ bool RouteOrch::addRoute(RouteBulkContext& ctx, const NextHopGroupKey &nextHops)
                 gRouteBulker.set_entry_attribute(&object_statuses.back(), &route_entry, &route_attr);
             }
 
-            // Set update preifx agg id if need
-            if (nextHops.is_srv6_vpn() ||
-                    (it_route->second.context_index != ctx.context_index && !ctx.context_index.empty()))
+            // Set/update prefix agg id if needed
+            if (!ctx.context_index.empty() || nextHops.is_srv6_vpn())
             {
-                if (!ctx.context_index.empty() && !m_srv6Orch->contextIdExists(ctx.context_index))
-                {
-                    SWSS_LOG_INFO("Context id %s does not exist", ctx.context_index.c_str());
-                    return false;
-                }
                 route_attr.id = SAI_ROUTE_ENTRY_ATTR_PREFIX_AGG_ID;
                 route_attr.value.u32 = ctx.nhg_index.empty() ? m_srv6Orch->getAggId(nextHops) : m_srv6Orch->getAggId(ctx.context_index);
                 object_statuses.emplace_back();
@@ -2675,6 +2779,13 @@ bool RouteOrch::addRoutePost(const RouteBulkContext& ctx, const NextHopGroupKey 
 
     m_syncdRoutes[vrf_id][ipPrefix] = RouteNhg(nextHops, ctx.nhg_index, ctx.context_index);
 
+    /* If this was a temp route, record the original desired NHG key
+     * so the guard in addRoute can detect NHG membership changes. */
+    if (ctx.tmp_next_hop.getSize() > 0)
+    {
+        m_syncdRoutes[vrf_id][ipPrefix].desired_nhg_key = ctx.nhg;
+    }
+
     /* add subnet decap term for VIP route */
     const SubnetDecapConfig &config = gTunneldecapOrch->getSubnetDecapConfig();
     if (config.enable && isVipRoute(ipPrefix, nextHops))
@@ -2964,11 +3075,9 @@ bool RouteOrch::removeRoutePost(const RouteBulkContext& ctx)
     return true;
 }
 
-bool RouteOrch::isRouteExists(const IpPrefix& prefix)
+bool RouteOrch::isRouteExists(sai_object_id_t vrf_id, const IpPrefix& prefix)
 {
     SWSS_LOG_ENTER();
-
-    sai_object_id_t& vrf_id = gVirtualRouterId;
 
     sai_route_entry_t route_entry;
     route_entry.vr_id = vrf_id;
@@ -2978,7 +3087,7 @@ bool RouteOrch::isRouteExists(const IpPrefix& prefix)
     if (it_route_table == m_syncdRoutes.end())
     {
         SWSS_LOG_INFO("Failed to find route table, vrf_id 0x%" PRIx64 "\n", vrf_id);
-        return true;
+        return false;
     }
     auto it_route = it_route_table->second.find(prefix);
     size_t creating = gRouteBulker.creating_entries_count(route_entry);

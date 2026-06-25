@@ -34,7 +34,7 @@ public:
 private:
     swss::Table m_state_telemetry_session;
     swss::DBConnector m_asic_db;
-    std::shared_ptr<swss::NotificationConsumer> m_asic_notification_consumer;
+    swss::NotificationConsumer* m_asic_notification_consumer = nullptr;
 
     std::unordered_map<std::string, std::shared_ptr<HFTelProfile>> m_name_profile_mapping;
     std::unordered_map<sai_object_type_t, std::unordered_set<std::shared_ptr<HFTelProfile>>> m_type_profile_mapping;
@@ -46,6 +46,7 @@ private:
     task_process_status groupTableDel(const std::string &profile_name, const std::string &group_name);
     std::shared_ptr<HFTelProfile> getProfile(const std::string &profile_name);
     std::shared_ptr<HFTelProfile> tryGetProfile(const std::string &profile_name);
+    bool isProfileInUse(const std::shared_ptr<HFTelProfile> &profile) const;
 
     void doTask(swss::NotificationConsumer &consumer);
     void doTask(Consumer &consumer);

@@ -1,23 +1,19 @@
 use std::{
     collections::LinkedList,
     sync::Arc,
-    thread::sleep,
     time::{Duration, Instant},
 };
 
+use std::os::unix::io::AsRawFd;
 #[cfg(test)]
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 
 use log::{debug, info, warn};
 
-#[allow(unused_imports)]
-use neli::{
-    consts::socket::{Msg, NlFamily},
-    router::synchronous::NlRouter,
-    socket::NlSocket,
-    utils::Groups,
-};
-use tokio::sync::mpsc::{Receiver, Sender};
+use netlink_sys::Socket;
+#[cfg(not(test))]
+use netlink_sys::{protocols::NETLINK_GENERIC, SocketAddr};
+use tokio::{select, sync::mpsc::{Receiver, Sender}, time::{interval, MissedTickBehavior}};
 
 use std::io;
 
@@ -25,14 +21,17 @@ use super::super::message::{
     buffer::SocketBufferMessage,
     netlink::{NetlinkCommand, SocketConnect},
 };
+use crate::utilities::{format_hex_lines, record_comm_stats, ChannelLabel};
+#[cfg(not(test))]
+use super::netlink_utils;
 
 #[cfg(not(test))]
-type SocketType = NlSocket;
+type SocketType = Socket;
 #[cfg(test)]
 type SocketType = test::MockSocket;
 
 /// Path to the sonic constants configuration file
-const SONIC_CONSTANTS: &str = "/usr/share/sonic/countersyncd/constants.yml";
+const SONIC_CONSTANTS: &str = "/etc/sonic/constants.yml";
 
 /// Size of the buffer used for receiving netlink messages
 const BUFFER_SIZE: usize = 0x1FFFF;
@@ -45,19 +44,16 @@ const ENOBUFS: i32 = 105;
 const MAX_LOCAL_RECONNECT_ATTEMPTS: u32 = 3;
 
 /// Socket health check timeout - if no data received for this duration, socket is considered unhealthy
-const SOCKET_HEALTH_TIMEOUT_SECS: u64 = 10;
+const SOCKET_HEALTH_TIMEOUT_SECS: u64 = 60;
 
-/// Heartbeat logging interval (in iterations) - log every 5 minutes at 10ms per iteration
-const HEARTBEAT_LOG_INTERVAL: u32 = 30000; // 30000 * 10ms = 5 minutes
+/// Target duration for heartbeat log (5 minutes).
+const HEARTBEAT_TARGET_MS: u64 = 5 * 60 * 1000;
 
-/// Debug logging interval (in iterations) - log debug info every 30 seconds
-const DEBUG_LOG_INTERVAL: u32 = 3000; // 3000 * 10ms = 30 seconds
+/// Target duration for debug log (30 seconds).
+const DEBUG_TARGET_MS: u64 = 30 * 1000;
 
-/// WouldBlock debug logging interval (in iterations) - log WouldBlock every minute
-const WOULDBLOCK_LOG_INTERVAL: u32 = 6000; // 6000 * 10ms = 1 minute
-
-/// Socket readiness check timeout in milliseconds
-const SOCKET_READINESS_TIMEOUT_MS: u64 = 10;
+/// Target duration for WouldBlock log (1 minute).
+const WOULDBLOCK_TARGET_MS: u64 = 60 * 1000;
 
 /// Maximum size for buffering incomplete messages (1MB)
 const MAX_INCOMPLETE_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -74,6 +70,11 @@ impl NetlinkMessageParser {
         Self {
             incomplete_buffer: Vec::new(),
         }
+    }
+
+    /// Mirrors `NLMSG_ALIGN` from `linux/netlink.h` by rounding lengths up to the next 4-byte boundary.
+    fn nlmsg_align(len: usize) -> usize {
+        (len + 3) & !3
     }
 
     /// Parse buffer that may contain multiple complete and/or incomplete netlink messages
@@ -131,9 +132,14 @@ impl NetlinkMessageParser {
                 break;
             }
 
-            // Extract complete message
+            let aligned_nl_len = Self::nlmsg_align(nl_len);
+
+            // Extract complete message without trailing alignment padding
             let message_data = self.incomplete_buffer[offset..offset + nl_len].to_vec();
-            debug!("Found complete message: offset={}, length={}", offset, nl_len);
+            debug!(
+                "Found complete message: offset={}, length={}, aligned_length={}",
+                offset, nl_len, aligned_nl_len
+            );
 
             // Extract payload from this message
             match Self::extract_payload_from_slice(&message_data) {
@@ -147,7 +153,8 @@ impl NetlinkMessageParser {
                 }
             }
 
-            offset += nl_len;
+            let remaining = self.incomplete_buffer.len() - offset;
+            offset += usize::min(aligned_nl_len, remaining);
         }
 
         // Keep remaining incomplete data for next recv
@@ -238,17 +245,21 @@ pub struct DataNetlinkActor {
     group: String,
     /// The active netlink socket connection (None if disconnected)
     socket: Option<SocketType>,
-    /// Reusable netlink resolver for family/group resolution (None if not available)
+    /// Reusable netlink socket for family/group resolution (None if not available)
     #[allow(dead_code)]
-    nl_resolver: Option<NlRouter>,
+    nl_resolver: Option<Socket>,
     /// Timestamp of when we last received data on the socket (for health checking)
-    last_data_time: Option<Instant>,
+    last_data_time: Instant,
     /// List of channels to send received buffer messages to
     buffer_recipients: LinkedList<Sender<SocketBufferMessage>>,
     /// Channel for receiving control commands
     command_recipient: Receiver<NetlinkCommand>,
     /// Message parser for handling multiple and fragmented netlink messages
     message_parser: NetlinkMessageParser,
+    /// Netlink socket receive buffer size in bytes (0 = OS default). Reduces ENOBUFS when set.
+    netlink_rcvbuf_bytes: usize,
+    /// Socket readiness poll interval in milliseconds. Shorter than HFT interval reduces ENOBUFS.
+    socket_readiness_timeout_ms: u64,
 }
 
 impl DataNetlinkActor {
@@ -259,21 +270,31 @@ impl DataNetlinkActor {
     /// * `family` - The generic netlink family name
     /// * `group` - The multicast group name
     /// * `command_recipient` - Channel for receiving control commands
+    /// * `netlink_rcvbuf_bytes` - Socket SO_RCVBUF size in bytes (0 = OS default). Larger values reduce ENOBUFS under high HFT load.
+    /// * `socket_readiness_timeout_ms` - Poll interval in ms for socket readiness. Shorter than HFT interval (e.g. 10 ms) reduces ENOBUFS.
     ///
     /// # Returns
     ///
     /// A new DataNetlinkActor instance with an initial connection attempt
-    pub fn new(family: &str, group: &str, command_recipient: Receiver<NetlinkCommand>) -> Self {
+    pub fn new(
+        family: &str,
+        group: &str,
+        command_recipient: Receiver<NetlinkCommand>,
+        netlink_rcvbuf_bytes: usize,
+        socket_readiness_timeout_ms: u64,
+    ) -> Self {
         let nl_resolver = Self::create_nl_resolver();
         let mut actor = DataNetlinkActor {
             family: family.to_string(),
             group: group.to_string(),
             socket: None,
             nl_resolver,
-            last_data_time: None,
+            last_data_time: Instant::now(),
             buffer_recipients: LinkedList::new(),
             command_recipient,
             message_parser: NetlinkMessageParser::new(),
+            netlink_rcvbuf_bytes,
+            socket_readiness_timeout_ms,
         };
 
         // Use instance method for initial connection
@@ -291,29 +312,21 @@ impl DataNetlinkActor {
         self.buffer_recipients.push_back(recipient);
     }
 
-    /// Creates a netlink resolver for family/group resolution.
+    /// Creates a netlink socket for family/group resolution.
     ///
     /// # Returns
     ///
-    /// Some(router) if creation is successful, None otherwise
+    /// Some(socket) if creation is successful, None otherwise
+    /// Creates a netlink socket for family/group resolution.
+    /// Now delegates to netlink_utils module.
     #[cfg(not(test))]
-    fn create_nl_resolver() -> Option<NlRouter> {
-        match NlRouter::connect(NlFamily::Generic, Some(0), Groups::empty()) {
-            Ok((router, _)) => {
-                debug!("Created netlink resolver for family/group resolution");
-                Some(router)
-            }
-            Err(e) => {
-                warn!("Failed to create netlink resolver: {:?}", e);
-                None
-            }
-        }
+    fn create_nl_resolver() -> Option<Socket> {
+        netlink_utils::create_nl_resolver()
     }
 
     /// Mock netlink resolver for testing.
     #[cfg(test)]
-    fn create_nl_resolver() -> Option<NlRouter> {
-        // Return None for tests to avoid complexity
+    fn create_nl_resolver() -> Option<Socket> {
         None
     }
 
@@ -335,17 +348,17 @@ impl DataNetlinkActor {
         );
 
         // Try to use existing netlink resolver first
-        let group_id = if let Some(ref resolver) = self.nl_resolver {
-            match resolver.resolve_nl_mcast_group(family, group) {
+        let group_id = if let Some(ref mut resolver) = self.nl_resolver {
+            match netlink_utils::resolve_multicast_group(resolver, family, group) {
                 Ok(id) => {
-                    debug!(
+                    info!(
                         "Resolved group ID {} for family '{}', group '{}' (using netlink resolver)",
                         id, family, group
                     );
                     id
                 }
                 Err(e) => {
-                    debug!(
+                    info!(
                         "Failed to resolve group with netlink resolver: {:?}, recreating resolver",
                         e
                     );
@@ -353,10 +366,10 @@ impl DataNetlinkActor {
                     self.nl_resolver = Self::create_nl_resolver();
 
                     // Try again with new resolver
-                    if let Some(ref resolver) = self.nl_resolver {
-                        match resolver.resolve_nl_mcast_group(family, group) {
+                    if let Some(ref mut resolver) = self.nl_resolver {
+                        match netlink_utils::resolve_multicast_group(resolver, family, group) {
                             Ok(id) => {
-                                debug!("Resolved group ID {} for family '{}', group '{}' (using new netlink resolver)", id, family, group);
+                                info!("Resolved group ID {} for family '{}', group '{}' (using new netlink resolver)", id, family, group);
                                 id
                             }
                             Err(e) => {
@@ -369,8 +382,8 @@ impl DataNetlinkActor {
                             }
                         }
                     } else {
-                        // Fallback to creating temporary router
-                        return Self::connect_fallback(family, group);
+                        // Fallback to creating temporary socket
+                        return Self::connect_fallback(family, group, self.netlink_rcvbuf_bytes);
                     }
                 }
             }
@@ -378,10 +391,10 @@ impl DataNetlinkActor {
             // Create netlink resolver if not available
             self.nl_resolver = Self::create_nl_resolver();
 
-            if let Some(ref resolver) = self.nl_resolver {
-                match resolver.resolve_nl_mcast_group(family, group) {
+            if let Some(ref mut resolver) = self.nl_resolver {
+                match netlink_utils::resolve_multicast_group(resolver, family, group) {
                     Ok(id) => {
-                        debug!("Resolved group ID {} for family '{}', group '{}' (using new netlink resolver)", id, family, group);
+                        info!("Resolved group ID {} for family '{}', group '{}' (using new netlink resolver)", id, family, group);
                         id
                     }
                     Err(e) => {
@@ -397,8 +410,8 @@ impl DataNetlinkActor {
                     }
                 }
             } else {
-                // Fallback to creating temporary router
-                return Self::connect_fallback(family, group);
+                // Fallback to creating temporary socket
+                return Self::connect_fallback(family, group, self.netlink_rcvbuf_bytes);
             }
         };
 
@@ -406,39 +419,48 @@ impl DataNetlinkActor {
             "Creating socket for family '{}' with group_id {}",
             family, group_id
         );
-        let socket = match SocketType::connect(
-            NlFamily::Generic,
-            // 0 is pid of kernel -> socket is connected to kernel
-            Some(0),
-            Groups::empty(),
-        ) {
-            Ok(socket) => socket,
+
+        // Create a raw netlink socket using netlink-sys
+        let mut socket = match Socket::new(NETLINK_GENERIC) {
+            Ok(s) => s,
             Err(e) => {
-                warn!("Failed to connect socket: {:?}", e);
+                warn!("Failed to create netlink socket: {:?}", e);
                 return None;
             }
         };
 
-        debug!("Adding multicast membership for group_id {}", group_id);
-        match socket.add_mcast_membership(Groups::new_groups(&[group_id])) {
-            Ok(_) => {
-                info!(
-                    "Successfully connected to family '{}', group '{}' with group_id: {}",
-                    family, group, group_id
-                );
-                debug!("Socket created successfully, ready to receive multicast messages on group_id: {}", group_id);
-                Some(socket)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to add mcast membership for group_id {}: {:?}",
-                    group_id, e
-                );
-                // Explicitly drop the socket to ensure it's closed
-                drop(socket);
-                None
-            }
+        // Bind the socket with automatic port assignment
+        let addr = SocketAddr::new(0, 0);
+        if let Err(e) = socket.bind(&addr) {
+            warn!("Failed to bind socket: {:?}", e);
+            return None;
         }
+
+        debug!("Adding multicast membership for group_id {}", group_id);
+        if let Err(e) = socket.add_membership(group_id) {
+            warn!(
+                "Failed to add mcast membership for group_id {}: {:?}",
+                group_id, e
+            );
+            // Explicitly drop the socket to ensure it's closed
+            drop(socket);
+            return None;
+        }
+
+        // Set non-blocking mode
+        if let Err(e) = socket.set_non_blocking(true) {
+            warn!("Failed to set non-blocking mode: {:?}", e);
+            return None;
+        }
+
+        netlink_utils::set_socket_rcvbuf(&socket, self.netlink_rcvbuf_bytes);
+
+        info!(
+            "Successfully connected to family '{}', group '{}' with group_id: {}",
+            family, group, group_id
+        );
+        debug!("Socket created successfully, ready to receive multicast messages on group_id: {}", group_id);
+        Some(socket)
     }
 
     /// Mock connection method using shared router for testing.
@@ -458,31 +480,38 @@ impl DataNetlinkActor {
 
     /// Fallback connection method when shared router is not available.
     #[cfg(not(test))]
-    fn connect_fallback(family: &str, group: &str) -> Option<SocketType> {
+    fn connect_fallback(
+        family: &str,
+        group: &str,
+        netlink_rcvbuf_bytes: usize,
+    ) -> Option<SocketType> {
         debug!(
             "Using fallback connection for family '{}', group '{}'",
             family, group
         );
 
-        let (sock, _) = match NlRouter::connect(
-            NlFamily::Generic,
-            // 0 is pid of kernel -> socket is connected to kernel
-            Some(0),
-            Groups::empty(),
-        ) {
-            Ok(result) => result,
+        // Create a temporary netlink socket for resolution
+        let mut temp_socket = match Socket::new(NETLINK_GENERIC) {
+            Ok(mut s) => {
+                let addr = SocketAddr::new(0, 0);
+                if let Err(e) = s.bind(&addr) {
+                    warn!("Failed to bind temporary socket: {:?}", e);
+                    return None;
+                }
+                s
+            }
             Err(e) => {
-                warn!("Failed to connect to netlink router: {:?}", e);
+                warn!("Failed to create temporary netlink socket: {:?}", e);
                 warn!("Possible causes: insufficient permissions, netlink not supported, or kernel module not loaded");
                 return None;
             }
         };
 
         debug!(
-            "Router connected, resolving group ID for family '{}', group '{}'",
+            "Temporary socket created, resolving group ID for family '{}', group '{}'",
             family, group
         );
-        let group_id = match sock.resolve_nl_mcast_group(family, group) {
+        let group_id = match netlink_utils::resolve_multicast_group(&mut temp_socket, family, group) {
             Ok(id) => {
                 debug!(
                     "Resolved group ID {} for family '{}', group '{}'",
@@ -499,8 +528,6 @@ impl DataNetlinkActor {
                     "This suggests the family '{}' is not registered in the kernel",
                     family
                 );
-                // Explicitly drop the temporary router to ensure it's closed
-                drop(sock);
                 return None;
             }
         };
@@ -509,79 +536,90 @@ impl DataNetlinkActor {
             "Creating socket for family '{}' with group_id {}",
             family, group_id
         );
-        let socket = match SocketType::connect(
-            NlFamily::Generic,
-            // 0 is pid of kernel -> socket is connected to kernel
-            Some(0),
-            Groups::empty(),
-        ) {
-            Ok(socket) => socket,
+
+        // Create a raw netlink socket
+        let mut socket = match Socket::new(NETLINK_GENERIC) {
+            Ok(s) => s,
             Err(e) => {
-                warn!("Failed to connect socket: {:?}", e);
-                // Explicitly drop the temporary router to ensure it's closed
-                drop(sock);
+                warn!("Failed to create netlink socket: {:?}", e);
                 return None;
             }
         };
 
-        debug!("Adding multicast membership for group_id {}", group_id);
-        match socket.add_mcast_membership(Groups::new_groups(&[group_id])) {
-            Ok(_) => {
-                info!(
-                    "Successfully connected to family '{}', group '{}' with group_id: {}",
-                    family, group, group_id
-                );
-                debug!("Socket created successfully, ready to receive multicast messages on group_id: {}", group_id);
-                // Explicitly drop the temporary router since we no longer need it
-                drop(sock);
-                Some(socket)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to add mcast membership for group_id {}: {:?}",
-                    group_id, e
-                );
-                // Explicitly drop both socket and temporary router to ensure they're closed
-                drop(socket);
-                drop(sock);
-                None
-            }
+        // Bind the socket
+        let addr = SocketAddr::new(0, 0);
+        if let Err(e) = socket.bind(&addr) {
+            warn!("Failed to bind socket: {:?}", e);
+            return None;
         }
+
+        debug!("Adding multicast membership for group_id {}", group_id);
+        if let Err(e) = socket.add_membership(group_id) {
+            warn!(
+                "Failed to add mcast membership for group_id {}: {:?}",
+                group_id, e
+            );
+            return None;
+        }
+
+        // Set non-blocking mode
+        if let Err(e) = socket.set_non_blocking(true) {
+            warn!("Failed to set non-blocking mode: {:?}", e);
+            return None;
+        }
+
+        netlink_utils::set_socket_rcvbuf(&socket, netlink_rcvbuf_bytes);
+
+        info!(
+            "Successfully connected to family '{}', group '{}' with group_id: {}",
+            family, group, group_id
+        );
+        debug!("Socket created successfully, ready to receive multicast messages on group_id: {}", group_id);
+        Some(socket)
     }
 
     /// Attempts to establish a connection on demand.
     ///
-    /// This will be called when receiving a Reconnect command from ControlNetlinkActor.
-    /// Implements socket health checking - if current socket hasn't received data recently,
-    /// it will be closed and replaced with a new connection.
-    fn connect(&mut self) {
-        // Check if current socket is healthy
-        if let Some(_socket) = &self.socket {
-            if let Some(last_data_time) = self.last_data_time {
-                let time_since_last_data = Instant::now().duration_since(last_data_time);
-                if time_since_last_data.as_secs() > SOCKET_HEALTH_TIMEOUT_SECS {
+    /// This will be called when receiving a Reconnect or SoftReconnect command from ControlNetlinkActor.
+    /// 
+    /// # Arguments
+    ///
+    /// * `force` - If true, always reconnect regardless of socket health status.
+    ///             If false, only reconnect if socket is unhealthy (no data received recently).
+    ///
+    /// # Behavior
+    ///
+    /// - `force=true` (Reconnect): Always closes current socket and creates new connection
+    /// - `force=false` (SoftReconnect): Only reconnects if socket hasn't received data for SOCKET_HEALTH_TIMEOUT_SECS
+    fn connect(&mut self, force: bool) {
+        // Check if current socket is healthy (only when not forcing reconnection)
+        if !force {
+            if let Some(_socket) = &self.socket {
+                let time_since_last_data = Instant::now().duration_since(self.last_data_time);
+                if time_since_last_data > Duration::from_secs(SOCKET_HEALTH_TIMEOUT_SECS) {
                     warn!(
                         "Socket unhealthy - no data received for {} seconds, forcing reconnection",
                         time_since_last_data.as_secs()
-                    );
-                    // Close the unhealthy socket
-                    self.socket = None;
-                    self.last_data_time = None;
+                        );
+                        // Close the unhealthy socket
+                        self.socket = None;
                 } else {
-                    debug!(
+                    info!(
                         "Socket healthy - data received {} seconds ago, skipping reconnect",
                         time_since_last_data.as_secs()
                     );
                     return;
                 }
-            } else {
-                // Socket exists but no data ever received - consider it new
-                debug!("Socket exists but no data received yet, skipping reconnect");
-                return;
+            }
+        } else {
+            // Force reconnection: close current socket if exists
+            if self.socket.is_some() {
+                info!("Force reconnection requested, closing current socket");
+                self.socket = None;
             }
         }
 
-        debug!(
+        info!(
             "Establishing new connection for family '{}', group '{}'",
             self.family, self.group
         );
@@ -591,7 +629,7 @@ impl DataNetlinkActor {
                 "Successfully connected to family '{}', group '{}'",
                 self.family, self.group
             );
-            self.last_data_time = None; // Reset data time for new socket
+            self.last_data_time = Instant::now(); // Reset data time for new socket
         } else {
             warn!(
                 "Failed to connect to family '{}', group '{}'",
@@ -613,7 +651,6 @@ impl DataNetlinkActor {
                 self.family, self.group
             );
             self.socket = None;
-            self.last_data_time = None;
             // Clear the resolver as it might be stale
             self.nl_resolver = None;
         }
@@ -632,7 +669,7 @@ impl DataNetlinkActor {
         );
         self.family = family.to_string();
         self.group = group.to_string();
-        self.connect();
+        self.connect(true); // Force reconnection on reset
     }
 
     /// Attempts to receive messages from the netlink socket.
@@ -653,12 +690,33 @@ impl DataNetlinkActor {
 
         let mut buffer = vec![0; BUFFER_SIZE];
 
-        // Try to receive with MSG_DONTWAIT to make it non-blocking
+        // Try to receive with non-blocking mode (socket should already be set to non-blocking)
         debug!("Attempting to receive netlink message...");
-        let result = socket.recv(&mut buffer, Msg::DONTWAIT);
+        #[cfg(not(test))]
+        let result = {
+            let fd = socket.as_raw_fd();
+            // Safe on the Tokio worker because the fd is already configured as non-blocking.
+            unsafe {
+                libc::recv(
+                    fd,
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    buffer.len(),
+                    0
+                )
+            }
+        };
+
+        #[cfg(test)]
+        let result = match socket.recv(&mut buffer, 0) {
+            Ok(size) => size as isize,
+            Err(e) => {
+                return Err(e);
+            }
+        };
 
         match result {
-            Ok((size, _groups)) => {
+            size if size > 0 => {
+                let size = size as usize;
                 debug!("Received netlink data, size: {} bytes", size);
 
                 if size == 0 {
@@ -671,57 +729,40 @@ impl DataNetlinkActor {
                 // Resize buffer to actual received size
                 buffer.resize(size, 0);
 
+                if log::log_enabled!(log::Level::Debug) {
+                    let hex_dump = format_hex_lines(&buffer);
+                    debug!(
+                        "Raw netlink recv buffer ({} bytes):\n{}",
+                        size, hex_dump
+                    );
+                }
+
                 // Parse buffer which may contain multiple messages and/or incomplete messages
                 let messages = message_parser.parse_buffer(&buffer)?;
                 debug!("Parsed {} complete messages from {} bytes of data", messages.len(), size);
-                
+
                 Ok(messages)
             }
-            Err(e) => {
-                debug!(
-                    "Socket recv failed: {:?} (raw_os_error: {:?})",
-                    e,
-                    e.raw_os_error()
-                );
-                Err(e)
+            size if size == 0 => {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Connection closed",
+                ))
             }
-        }
-    }
-
-    /// Checks for socket readiness without unsafe operations.
-    ///
-    /// This is a safer alternative that uses tokio's timeout mechanism
-    /// instead of direct file descriptor polling with unsafe operations.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout_ms` - Timeout in milliseconds
-    ///
-    /// # Returns
-    ///
-    /// A boolean indicating if data socket has data
-    async fn check_socket_readiness(timeout_ms: u64) -> Result<bool, io::Error> {
-        // In test environment, always return true to let try_recv() handle the actual data availability
-        #[cfg(test)]
-        {
-            // Simulate minimal polling delay
-            sleep(Duration::from_millis(std::cmp::min(timeout_ms, 1)));
-            // Always return true in test mode - let MockSocket.recv() handle availability
-            return Ok(true);
-        }
-
-        #[cfg(not(test))]
-        {
-            use tokio::time::{sleep as tokio_sleep, Duration as TokioDuration};
-
-            // For production, we simply wait for the timeout period
-            // This approach avoids unsafe operations but is less efficient
-            // The actual socket readiness will be checked by try_recv() calls
-            tokio_sleep(TokioDuration::from_millis(timeout_ms)).await;
-
-            // Always return that data might be ready, let try_recv() handle the actual check
-            // This is safe but potentially less efficient than direct polling
-            Ok(true)
+            _ => {
+                // size < 0, errno is set
+                let err = io::Error::last_os_error();
+                // WouldBlock is expected for non-blocking sockets with no data
+                // Only log other errors
+                if err.kind() != io::ErrorKind::WouldBlock {
+                    debug!(
+                        "Socket recv failed: {:?} (raw_os_error: {:?})",
+                        err,
+                        err.raw_os_error()
+                    );
+                }
+                Err(err)
+            }
         }
     }
 
@@ -738,115 +779,131 @@ impl DataNetlinkActor {
         );
         let mut heartbeat_counter = 0u32;
         let mut consecutive_failures = 0u32;
+        let poll_ms = actor.socket_readiness_timeout_ms.max(1);
+        let heartbeat_interval = (HEARTBEAT_TARGET_MS / poll_ms).max(1) as u32;
+        let debug_interval = (DEBUG_TARGET_MS / poll_ms).max(1) as u32;
+        let wouldblock_interval = (WOULDBLOCK_TARGET_MS / poll_ms).max(1) as u32;
+        let mut poll_interval = interval(Duration::from_millis(poll_ms));
+        poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
-            // Log heartbeat every 5 minutes to show the actor is running
-            heartbeat_counter += 1;
-            if heartbeat_counter % HEARTBEAT_LOG_INTERVAL == 0 {
-                info!("DataNetlinkActor is running normally - waiting for data messages");
-            }
-
-            // More frequent debug info about socket status
-            if heartbeat_counter % DEBUG_LOG_INTERVAL == 0 {
-                debug!(
-                    "DataNetlinkActor heartbeat: socket={}, recipients={}, failures={}",
-                    actor.socket.is_some(),
-                    actor.buffer_recipients.len(),
-                    consecutive_failures
-                );
-                if actor.socket.is_some() {
-                    debug!("Socket is available and we are actively trying to receive messages");
-                    consecutive_failures = 0; // Reset failure counter when socket is available
-                }
-            }
-
-            // Check for pending commands first (non-blocking)
-            if let Ok(command) = actor.command_recipient.try_recv() {
-                match command {
-                    NetlinkCommand::SocketConnect(SocketConnect { family, group }) => {
-                        actor.reset(&family, &group);
-                        consecutive_failures = 0; // Reset failure counter on reconnect command
-                    }
-                    NetlinkCommand::Reconnect => {
-                        actor.connect();
-                        consecutive_failures = 0; // Reset failure counter on reconnect command
-                    }
-                    NetlinkCommand::Close => {
-                        break;
+            select! {
+                command = actor.command_recipient.recv() => {
+                    match command {
+                        Some(command) => {
+                            record_comm_stats(
+                                ChannelLabel::ControlNetlinkToDataNetlink,
+                                actor.command_recipient.len(),
+                            );
+                            match command {
+                                NetlinkCommand::SocketConnect(SocketConnect { family, group }) => {
+                                    actor.reset(&family, &group);
+                                    consecutive_failures = 0;
+                                }
+                                NetlinkCommand::Reconnect => {
+                                    actor.connect(true);
+                                    consecutive_failures = 0;
+                                }
+                                NetlinkCommand::SoftReconnect => {
+                                    actor.connect(false);
+                                    consecutive_failures = 0;
+                                }
+                                NetlinkCommand::Close => {
+                                    break;
+                                }
+                            }
+                        }
+                        None => break,
                     }
                 }
-                continue;
-            }
+                _ = poll_interval.tick() => {
+                    heartbeat_counter += 1;
+                    if heartbeat_counter % heartbeat_interval == 0 {
+                        info!("DataNetlinkActor is running normally - waiting for data messages");
+                    }
 
-            // Check socket readiness with configurable timeout to allow periodic checks
-            match Self::check_socket_readiness(SOCKET_READINESS_TIMEOUT_MS).await {
-                Ok(data_ready) => {
-                    // Only try to receive data if we have a socket and data is ready
-                    if actor.socket.is_some() && data_ready {
+                    if heartbeat_counter % debug_interval == 0 {
+                        debug!(
+                            "DataNetlinkActor heartbeat: socket={}, recipients={}, failures={}",
+                            actor.socket.is_some(),
+                            actor.buffer_recipients.len(),
+                            consecutive_failures
+                        );
+                        if actor.socket.is_some() {
+                            debug!("Socket is available and we are actively trying to receive messages");
+                            consecutive_failures = 0;
+                        }
+                    }
+
+                    if actor.socket.is_some() {
                         match Self::try_recv(actor.socket.as_mut(), &mut actor.message_parser).await {
                             Ok(messages) => {
-                                consecutive_failures = 0; // Reset failure counter on successful receive
-                                actor.last_data_time = Some(Instant::now()); // Update data reception timestamp
-                                
+                                consecutive_failures = 0;
+                                actor.last_data_time = Instant::now();
+
                                 if messages.is_empty() {
                                     debug!("Received data but no complete messages yet (partial message)");
                                 } else {
                                     debug!("Successfully parsed {} complete netlink messages", messages.len());
-                                    
-                                    // Send each complete netlink message individually to all recipients
-                                    // This ensures each IPFIX message (contained in one netlink message) 
-                                    // is sent as a separate operation to the downstream actors
+
                                     for (i, message) in messages.iter().enumerate() {
-                                        debug!("Processing netlink message {}/{}: {} bytes", 
+                                        if log::log_enabled!(log::Level::Debug) {
+                                            let hex_dump = format_hex_lines(message.as_ref());
+                                            debug!(
+                                                "Outgoing netlink payload {}/{} ({} bytes):\n{}",
+                                                i + 1,
+                                                messages.len(),
+                                                message.len(),
+                                                hex_dump
+                                            );
+                                        }
+                                        debug!("Processing netlink message {}/{}: {} bytes",
                                                i + 1, messages.len(), message.len());
-                                        
-                                        // Send this single netlink message to all recipients
+
                                         for (j, recipient) in actor.buffer_recipients.iter().enumerate() {
-                                            debug!("Sending netlink message {}/{} to recipient {}", 
+                                            debug!("Sending netlink message {}/{} to recipient {}",
                                                    i + 1, messages.len(), j + 1);
                                             if let Err(e) = recipient.send(message.clone()).await {
-                                                warn!("Failed to send netlink message {}/{} to recipient {}: {:?}", 
+                                                warn!("Failed to send netlink message {}/{} to recipient {}: {:?}",
                                                       i + 1, messages.len(), j + 1, e);
-                                                // Consider removing failed recipients here if needed
                                             } else {
-                                                debug!("Successfully sent netlink message {}/{} ({} bytes) to recipient {}", 
+                                                debug!("Successfully sent netlink message {}/{} ({} bytes) to recipient {}",
                                                        i + 1, messages.len(), message.len(), j + 1);
                                             }
                                         }
                                     }
-                                    
+
                                     debug!("Completed processing {} netlink messages, each sent individually", messages.len());
                                 }
                             }
                             Err(e) => {
-                                // Handle specific errors
                                 if let Some(os_error) = e.raw_os_error() {
                                     if os_error == ENOBUFS {
-                                        warn!("Netlink receive buffer full (ENOBUFS). Consider increasing buffer size or processing messages faster. Error: {:?}", e);
+                                        warn!(
+                                            "Netlink receive buffer full (ENOBUFS). poll_interval_ms={}. Consider reducing --socket-readiness-timeout-ms or increasing buffer. Error: {:?}",
+                                            actor.socket_readiness_timeout_ms, e
+                                        );
                                         // Don't disconnect on ENOBUFS, just continue
                                         continue;
                                     }
                                 }
 
-                                // Check if it's WouldBlock using standard ErrorKind
                                 if e.kind() == io::ErrorKind::WouldBlock {
                                     // No data available right now, continue normally
-                                    if heartbeat_counter % WOULDBLOCK_LOG_INTERVAL == 0 {
+                                    if heartbeat_counter % wouldblock_interval == 0 {
                                         debug!("No netlink data available (WouldBlock) - socket is connected but no messages from kernel");
                                     }
                                 } else {
-                                    // Socket error occurred, disconnect and try limited reconnects
                                     warn!("Failed to receive message: {:?}", e);
                                     actor.disconnect();
                                     consecutive_failures += 1;
 
-                                    // Only attempt very limited local reconnects
                                     if consecutive_failures <= MAX_LOCAL_RECONNECT_ATTEMPTS {
                                         debug!(
                                             "Attempting quick reconnect #{}",
                                             consecutive_failures
                                         );
-                                        actor.connect();
+                                        actor.connect(true);
                                     } else {
                                         debug!("Too many consecutive failures, waiting for reconnect command from ControlNetlinkActor");
                                     }
@@ -855,15 +912,10 @@ impl DataNetlinkActor {
                         }
                     } else if actor.socket.is_none() {
                         // No socket available, log this periodically but don't spam
-                        if heartbeat_counter % DEBUG_LOG_INTERVAL == 0 {
+                        if heartbeat_counter % debug_interval == 0 {
                             debug!("No socket available - waiting for reconnect command from ControlNetlinkActor");
                         }
                     }
-                }
-                Err(e) => {
-                    warn!("Poll error: {:?}", e);
-                    // Wait a bit before retrying to avoid busy loop on persistent poll errors
-                    sleep(Duration::from_millis(SOCKET_READINESS_TIMEOUT_MS));
                 }
             }
         }
@@ -950,6 +1002,15 @@ pub mod test {
         msg
     }
 
+    fn append_aligned_mock_netlink_message(buffer: &mut Vec<u8>, payload: &[u8]) {
+        let msg = create_mock_netlink_message(payload);
+        let msg_len = 20 + payload.len();
+        let aligned_len = NetlinkMessageParser::nlmsg_align(msg_len);
+
+        buffer.extend_from_slice(&msg[..msg_len]);
+        buffer.resize(buffer.len() + (aligned_len - msg_len), 0);
+    }
+
     // Use atomic counter instead of unsafe static mut for thread safety
     static SOCKET_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -1006,9 +1067,9 @@ pub mod test {
         ///
         /// # Returns
         ///
-        /// Ok((size, groups)) on success, Err on failure or empty message
-        pub fn recv(&mut self, buf: &mut [u8], _flags: Msg) -> Result<(usize, Groups), io::Error> {
-            sleep(Duration::from_millis(1));
+        /// Ok(size) on success, Err on failure or empty message
+        pub fn recv(&mut self, buf: &mut [u8], _flags: i32) -> Result<usize, io::Error> {
+            std::thread::sleep(Duration::from_millis(1));
 
             if self.budget == 0 {
                 // When there are no more messages, return WouldBlock to simulate non-blocking behavior
@@ -1026,7 +1087,7 @@ pub mod test {
                 let copy_len = std::cmp::min(msg.len(), buf.len());
                 buf[..copy_len].copy_from_slice(&msg[..copy_len]);
 
-                Ok((copy_len, Groups::empty()))
+                Ok(copy_len)
             } else {
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -1056,7 +1117,7 @@ pub mod test {
         let (command_sender, command_receiver) = channel(1);
         let (buffer_sender, mut buffer_receiver) = channel(1);
 
-        let mut actor = DataNetlinkActor::new("family", "group", command_receiver);
+        let mut actor = DataNetlinkActor::new("family", "group", command_receiver, 0, 5);
         actor.add_recipient(buffer_sender);
 
         let task = spawn(DataNetlinkActor::run(actor));
@@ -1119,13 +1180,13 @@ pub mod test {
         let mock_msg = create_mock_netlink_message(b"TEST_PAYLOAD");
         let actual_len = 20 + b"TEST_PAYLOAD".len(); // 16 (nlmsg) + 4 (genl) + payload
         let mut parser = NetlinkMessageParser::new();
-        
+
         let result = parser.parse_buffer(&mock_msg[..actual_len]);
         assert!(result.is_ok());
 
         let messages = result.unwrap();
         assert_eq!(messages.len(), 1);
-        
+
         let payload = &messages[0];
         let payload_str = String::from_utf8(payload.to_vec()).unwrap();
         assert_eq!(payload_str, "TEST_PAYLOAD");
@@ -1156,7 +1217,7 @@ pub mod test {
 
         let result = parser.parse_buffer(&buffer);
         assert!(result.is_ok());
-        
+
         // Should have no complete messages due to insufficient data
         let messages = result.unwrap();
         assert!(messages.is_empty());
@@ -1166,28 +1227,47 @@ pub mod test {
     #[test]
     fn test_multiple_messages_in_buffer() {
         let mut combined_buffer = Vec::new();
-        
+
         // Create two messages
         let msg1 = create_mock_netlink_message(b"MESSAGE1");
         let msg1_len = 20 + b"MESSAGE1".len();
         let msg2 = create_mock_netlink_message(b"MESSAGE2");
         let msg2_len = 20 + b"MESSAGE2".len();
-        
+
         // Combine them in one buffer (simulate receiving multiple messages in one recv)
         combined_buffer.extend_from_slice(&msg1[..msg1_len]);
         combined_buffer.extend_from_slice(&msg2[..msg2_len]);
-        
+
         let mut parser = NetlinkMessageParser::new();
         let result = parser.parse_buffer(&combined_buffer);
         assert!(result.is_ok());
-        
+
         let messages = result.unwrap();
         assert_eq!(messages.len(), 2);
-        
+
         let payload1_str = String::from_utf8(messages[0].to_vec()).unwrap();
         let payload2_str = String::from_utf8(messages[1].to_vec()).unwrap();
         assert_eq!(payload1_str, "MESSAGE1");
         assert_eq!(payload2_str, "MESSAGE2");
+    }
+
+    /// Tests handling multiple aligned messages where the first message length
+    /// is not a multiple of 4 and therefore requires netlink padding.
+    #[test]
+    fn test_multiple_aligned_messages_in_buffer() {
+        let mut combined_buffer = Vec::new();
+
+        append_aligned_mock_netlink_message(&mut combined_buffer, b"A");
+        append_aligned_mock_netlink_message(&mut combined_buffer, b"SECOND");
+
+        let mut parser = NetlinkMessageParser::new();
+        let result = parser.parse_buffer(&combined_buffer);
+        assert!(result.is_ok());
+
+        let messages = result.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(String::from_utf8(messages[0].to_vec()).unwrap(), "A");
+        assert_eq!(String::from_utf8(messages[1].to_vec()).unwrap(), "SECOND");
     }
 
     /// Tests handling fragmented messages across multiple recv operations.
@@ -1196,21 +1276,21 @@ pub mod test {
         let msg = create_mock_netlink_message(b"FRAGMENTED_MESSAGE");
         let msg_len = 20 + b"FRAGMENTED_MESSAGE".len();
         let mut parser = NetlinkMessageParser::new();
-        
+
         // Simulate first recv getting only part of the message
         let first_part = &msg[..15]; // Less than header size
         let result1 = parser.parse_buffer(first_part);
         assert!(result1.is_ok());
         let messages1 = result1.unwrap();
         assert!(messages1.is_empty()); // No complete messages yet
-        
+
         // Simulate second recv getting the rest
         let second_part = &msg[15..msg_len];
         let result2 = parser.parse_buffer(second_part);
         assert!(result2.is_ok());
         let messages2 = result2.unwrap();
         assert_eq!(messages2.len(), 1);
-        
+
         let payload_str = String::from_utf8(messages2[0].to_vec()).unwrap();
         assert_eq!(payload_str, "FRAGMENTED_MESSAGE");
     }
@@ -1219,35 +1299,35 @@ pub mod test {
     #[test]
     fn test_mixed_complete_and_partial() {
         let mut combined_buffer = Vec::new();
-        
+
         // First complete message
         let msg1 = create_mock_netlink_message(b"COMPLETE");
         let msg1_len = 20 + b"COMPLETE".len();
         combined_buffer.extend_from_slice(&msg1[..msg1_len]);
-        
+
         // Partial second message
         let msg2 = create_mock_netlink_message(b"PARTIAL_MSG");
         let msg2_len = 20 + b"PARTIAL_MSG".len();
         combined_buffer.extend_from_slice(&msg2[..25]); // Only part of second message
-        
+
         let mut parser = NetlinkMessageParser::new();
         let result1 = parser.parse_buffer(&combined_buffer);
         assert!(result1.is_ok());
-        
+
         let messages1 = result1.unwrap();
         assert_eq!(messages1.len(), 1); // Only first complete message
-        
+
         let payload1_str = String::from_utf8(messages1[0].to_vec()).unwrap();
         assert_eq!(payload1_str, "COMPLETE");
-        
+
         // Send remaining part of second message
         let remaining_part = &msg2[25..msg2_len];
         let result2 = parser.parse_buffer(remaining_part);
         assert!(result2.is_ok());
-        
+
         let messages2 = result2.unwrap();
         assert_eq!(messages2.len(), 1); // Second message now complete
-        
+
         let payload2_str = String::from_utf8(messages2[0].to_vec()).unwrap();
         assert_eq!(payload2_str, "PARTIAL_MSG");
     }
@@ -1309,6 +1389,27 @@ pub mod test {
             assert!(!group.is_empty());
         }
     }
+
+    #[test]
+    fn test_netlink_rcvbuf_stored_on_construction() {
+        let (_, command_receiver) = channel(1);
+        let actor = DataNetlinkActor::new("family", "group", command_receiver, 4194304, 5);
+        assert_eq!(actor.netlink_rcvbuf_bytes, 4194304);
+    }
+
+    #[test]
+    fn test_log_interval_cadence() {
+        // Verify that computed intervals match target durations for various poll rates.
+        for poll_ms in [1u64, 5, 10, 50, 100] {
+            let heartbeat = (HEARTBEAT_TARGET_MS / poll_ms).max(1);
+            let debug = (DEBUG_TARGET_MS / poll_ms).max(1);
+            let wouldblock = (WOULDBLOCK_TARGET_MS / poll_ms).max(1);
+            assert_eq!(heartbeat * poll_ms, HEARTBEAT_TARGET_MS, "poll_ms={}", poll_ms);
+            assert_eq!(debug * poll_ms, DEBUG_TARGET_MS, "poll_ms={}", poll_ms);
+            assert_eq!(wouldblock * poll_ms, WOULDBLOCK_TARGET_MS, "poll_ms={}", poll_ms);
+        }
+    }
+
 }
 
 /// Reads the Generic Netlink family and group names from the configuration file.

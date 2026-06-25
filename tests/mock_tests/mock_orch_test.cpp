@@ -10,6 +10,27 @@ void MockOrchTest::PostSetUp() {}
 void MockOrchTest::PreTearDown() {}
 void MockOrchTest::ApplySaiMock() {}
 
+void MockOrchTest::initTestLogger(const std::string &appName, int minPrio)
+{
+    const char *syslogStdout = std::getenv("SWSS_SYSLOG_STDOUT");
+    if (syslogStdout != nullptr && std::string(syslogStdout) == "1")
+    {
+        static std::once_flag loggerInitFlag;
+
+        std::call_once(loggerInitFlag, [&appName]() {
+            swss::Logger::linkToDbNative(appName);
+        });
+
+        swss::Logger::swssOutputNotify("orchagent", "STDOUT");
+        swss::Logger::setMinPrio(static_cast<swss::Logger::Priority>(minPrio));
+    }
+}
+
+DashOrch* MockOrchTest::CreateDashOrch(swss::DBConnector* app_db, const std::vector<std::string>& dash_tables, swss::DBConnector* state_db, swss::ZmqServer* zmq)
+{
+    return new DashOrch(app_db, const_cast<std::vector<std::string>&>(dash_tables), state_db, zmq);
+}
+
 void MockOrchTest::PrepareSai()
 {
     sai_attribute_t attr;
@@ -61,6 +82,8 @@ void MockOrchTest::PrepareSai()
 
 void MockOrchTest::SetUp()
 {
+    initTestLogger();
+
     map<string, string> profile = {
         { "SAI_VS_SWITCH_TYPE", "SAI_VS_SWITCH_TYPE_BCM56850" },
         { "KV_DEVICE_MAC_ADDRESS", "20:03:04:05:06:00" }
@@ -120,7 +143,10 @@ void MockOrchTest::SetUp()
     ut_orch_list.push_back((Orch **)&gVrfOrch);
     global_orch_list.insert((Orch **)&gVrfOrch);
 
-    gIntfsOrch = new IntfsOrch(m_app_db.get(), APP_INTF_TABLE_NAME, gVrfOrch, m_chassis_app_db.get());
+    vector<table_name_with_pri_t> intf_tables = {
+        { APP_INTF_TABLE_NAME, IntfsOrch::intfsorch_pri }
+    };
+    gIntfsOrch = new IntfsOrch(m_app_db.get(), intf_tables, gVrfOrch, m_chassis_app_db.get());
     gDirectory.set(gIntfsOrch);
     ut_orch_list.push_back((Orch **)&gIntfsOrch);
     global_orch_list.insert((Orch **)&gIntfsOrch);
@@ -129,6 +155,19 @@ void MockOrchTest::SetUp()
     gDirectory.set(gPortsOrch);
     ut_orch_list.push_back((Orch **)&gPortsOrch);
     global_orch_list.insert((Orch **)&gPortsOrch);
+
+    // Create EvpnMhOrch early so its ES/DF state is available when PortsOrch
+    // processes bridge ports and VLAN members (matches production code order)
+    TableConnector appDbDfTable(m_app_db.get(), "EVPN_DF_TABLE");
+    TableConnector confDbEvpnEsTable(m_config_db.get(), "EVPN_ETHERNET_SEGMENT");
+    vector<TableConnector> evpn_df_es_table_connectors = {
+        appDbDfTable,
+        confDbEvpnEsTable,
+    };
+    gEvpnMhOrch = new EvpnMhOrch(evpn_df_es_table_connectors);
+    gDirectory.set(gEvpnMhOrch);
+    ut_orch_list.push_back((Orch **)&gEvpnMhOrch);
+    global_orch_list.insert((Orch **)&gEvpnMhOrch);
 
     const int fgnhgorch_pri = 15;
 
@@ -153,7 +192,8 @@ void MockOrchTest::SetUp()
 
     TableConnector stateDbFdb(m_state_db.get(), STATE_FDB_TABLE_NAME);
     TableConnector stateMclagDbFdb(m_state_db.get(), STATE_MCLAG_REMOTE_FDB_TABLE_NAME);
-    gFdbOrch = new FdbOrch(m_app_db.get(), app_fdb_tables, stateDbFdb, stateMclagDbFdb, gPortsOrch);
+    gFdbOrch = new FdbOrch(m_app_db.get(), app_fdb_tables, stateDbFdb, stateMclagDbFdb, gPortsOrch,
+                           m_config_db.get());
     gDirectory.set(gFdbOrch);
     ut_orch_list.push_back((Orch **)&gFdbOrch);
     global_orch_list.insert((Orch **)&gFdbOrch);
@@ -222,19 +262,30 @@ void MockOrchTest::SetUp()
     ut_orch_list.push_back((Orch **)&gCrmOrch);
     global_orch_list.insert((Orch **)&gCrmOrch);
 
+    vector<string> ars_tables = {
+        CFG_ARS_PROFILE_TABLE_NAME,
+        CFG_ARS_INTERFACE_TABLE_NAME,
+        CFG_ARS_OBJECT_TABLE_NAME,
+        CFG_ARS_NEXTHOP_TABLE_NAME
+    };
+    gArsOrch = new ArsOrch(m_config_db.get(), m_app_db.get(), m_state_db.get(), ars_tables, gVrfOrch);
+    gDirectory.set(gArsOrch);
+    ut_orch_list.push_back((Orch **)&gArsOrch);
+    global_orch_list.insert((Orch **)&gArsOrch);
+
     const int routeorch_pri = 5;
     vector<table_name_with_pri_t> route_tables = {
         { APP_ROUTE_TABLE_NAME, routeorch_pri },
         { APP_LABEL_ROUTE_TABLE_NAME, routeorch_pri }
     };
-    gRouteOrch = new RouteOrch(m_app_db.get(), route_tables, gSwitchOrch, gNeighOrch, gIntfsOrch, gVrfOrch, gFgNhgOrch, gSrv6Orch);
+    gRouteOrch = new RouteOrch(m_app_db.get(), route_tables, gSwitchOrch, gNeighOrch, gIntfsOrch, gVrfOrch, gFgNhgOrch, gSrv6Orch, gArsOrch);
     gDirectory.set(gRouteOrch);
     ut_orch_list.push_back((Orch **)&gRouteOrch);
     global_orch_list.insert((Orch **)&gRouteOrch);
 
     TableConnector stateDbMirrorSession(m_state_db.get(), STATE_MIRROR_SESSION_TABLE_NAME);
     TableConnector confDbMirrorSession(m_config_db.get(), CFG_MIRROR_SESSION_TABLE_NAME);
-    gMirrorOrch = new MirrorOrch(stateDbMirrorSession, confDbMirrorSession, gPortsOrch, gRouteOrch, gNeighOrch, gFdbOrch, gPolicerOrch);
+    gMirrorOrch = new MirrorOrch(stateDbMirrorSession, confDbMirrorSession, gPortsOrch, gRouteOrch, gNeighOrch, gFdbOrch, gPolicerOrch, gSwitchOrch);
     gDirectory.set(gMirrorOrch);
     ut_orch_list.push_back((Orch **)&gMirrorOrch);
     global_orch_list.insert((Orch **)&gMirrorOrch);
@@ -247,7 +298,7 @@ void MockOrchTest::SetUp()
         APP_DASH_QOS_TABLE_NAME
     };
 
-    m_DashOrch = new DashOrch(m_app_db.get(), dash_tables, m_dpu_app_state_db.get(), nullptr);
+    m_DashOrch = CreateDashOrch(m_app_db.get(), dash_tables, m_dpu_app_state_db.get(), nullptr);
     gDirectory.set(m_DashOrch);
     ut_orch_list.push_back((Orch **)&m_DashOrch);
 
@@ -256,7 +307,7 @@ void MockOrchTest::SetUp()
         APP_DASH_METER_RULE_TABLE_NAME
     };
 
-    m_DashMeterOrch = new DashMeterOrch(m_app_db.get(), dash_meter_tables, m_DashOrch, m_dpu_app_state_db.get(), nullptr);
+    m_DashMeterOrch = new DashMeterOrch(m_app_db.get(), dash_meter_tables, m_dpu_app_state_db.get(), nullptr);
     gDirectory.set(m_DashMeterOrch);
     ut_orch_list.push_back((Orch **)&m_DashMeterOrch);
 

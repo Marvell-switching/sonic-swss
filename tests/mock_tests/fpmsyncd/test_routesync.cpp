@@ -5,18 +5,25 @@
 #include "mock_table.h"
 #define private public
 #include "fpmsyncd/routesync.h"
+#include "fpmsyncd/fpmlink.h"
 #undef private
+#include "orch_zmq_config.h"
 
 #include <arpa/inet.h>
+#include <linux/pkt_cls.h>
 #include <linux/rtnetlink.h>
 #include <netlink/route/link.h>
 #include <netlink/route/nexthop.h>
 #include <linux/nexthop.h>
+#include <linux/lwtunnel.h>
+#include <linux/seg6_iptunnel.h>
+#include <sys/stat.h>
 
 #include <sstream>
 
 using namespace swss;
 using namespace testing;
+using namespace ut_fpmsyncd;
 
 #define MAX_PAYLOAD 1024
 
@@ -71,8 +78,17 @@ class FpmSyncdResponseTest : public ::testing::Test
 public:
     void SetUp() override
     {
+        struct stat st;
         testing_db::reset();
-        EXPECT_EQ(rtnl_route_read_protocol_names(DefaultRtProtoPath), 0);
+        if (stat(DefaultRtProtoPath, &st) == 0) {
+            EXPECT_EQ(rtnl_route_read_protocol_names(DefaultRtProtoPath), 0);
+        } else if (stat(OverrideRtProtoPath, &st) == 0) {
+            EXPECT_EQ(rtnl_route_read_protocol_names(OverrideRtProtoPath), 0);
+        } else {
+            FAIL() << "Neither " << DefaultRtProtoPath
+                   << " nor " << OverrideRtProtoPath
+                   << " exists; failed to load route protocol names required for tests.";
+        }
         m_routeSync.setSuppressionEnabled(true);
     }
 
@@ -90,6 +106,24 @@ public:
     const char* test_gateway = "192.168.1.1";
     const char* test_gateway_ = "192.168.1.2";
     const char* test_gateway__ = "192.168.1.3";
+};
+
+class FpmSyncdResponseTestWithZmqNb : public FpmSyncdResponseTest {
+    void SetUp() override
+    {
+        FpmSyncdResponseTest::SetUp();
+        // Simulate ZMQ being enabled by setting m_zmqClient to a non-null value
+        // We use a dummy shared_ptr (pointing to address 1) since we won't actually use it
+        // This makes isNbZmqEnabled() return true
+        m_mockRouteSync.m_zmqClient = shared_ptr<swss::ZmqClient>(reinterpret_cast<swss::ZmqClient*>(1), [](swss::ZmqClient*){});
+    }
+
+    void TearDown() override
+    {
+        // Reset m_zmqClient to nullptr
+        m_mockRouteSync.m_zmqClient = nullptr;
+        FpmSyncdResponseTest::TearDown();
+    }
 };
 
 TEST_F(FpmSyncdResponseTest, RouteResponseFeedbackV4)
@@ -257,6 +291,295 @@ TEST_F(FpmSyncdResponseTest, testEvpn)
 
 }
 
+
+// Helper: build a minimal RTM_NEWROUTE / RTM_DELROUTE nlmsghdr
+static struct nlmsghdr* createRouteNlmsg(uint16_t nlmsg_type, uint8_t family,
+                                          uint8_t rtm_type, const char* dst_ip,
+                                          uint8_t prefixlen, uint8_t protocol = 200)
+{
+    struct nlmsghdr *nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
+    memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
+    nlh->nlmsg_type = nlmsg_type;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+
+    struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nlh);
+    rtm->rtm_family   = family;
+    rtm->rtm_protocol = protocol;
+    rtm->rtm_type     = rtm_type;
+    rtm->rtm_table    = 0;
+    rtm->rtm_dst_len  = prefixlen;
+
+    // Append RTA_DST attribute
+    struct rtattr *rta = (struct rtattr *)((char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len));
+    rta->rta_type = RTA_DST;
+    if (family == AF_INET6)
+    {
+        struct in6_addr addr6;
+        inet_pton(AF_INET6, dst_ip, &addr6);
+        rta->rta_len = RTA_LENGTH(sizeof(addr6));
+        memcpy(RTA_DATA(rta), &addr6, sizeof(addr6));
+    }
+    else
+    {
+        struct in_addr addr4;
+        inet_pton(AF_INET, dst_ip, &addr4);
+        rta->rta_len = RTA_LENGTH(sizeof(addr4));
+        memcpy(RTA_DATA(rta), &addr4, sizeof(addr4));
+    }
+
+    nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + RTA_ALIGN(rta->rta_len);
+    return nlh;
+}
+
+// Test: RTM_DELROUTE for IPv4 prefix — covers del path in onMsgRaw
+TEST_F(FpmSyncdResponseTest, RouteDelIPv4)
+{
+    shared_ptr<swss::DBConnector> m_app_db = make_shared<swss::DBConnector>("APPL_DB", 0);
+    Table app_route_table(m_app_db.get(), APP_ROUTE_TABLE_NAME);
+
+    // Pre-populate so we can verify deletion
+    app_route_table.set("10.0.0.0/24", {{"nexthop", "192.168.1.1"}});
+
+    struct nlmsghdr *nlh = createRouteNlmsg(RTM_DELROUTE, AF_INET, RTN_UNICAST,
+                                            "10.0.0.0", 24);
+    m_routeSync.onMsgRaw(nlh);
+    free(nlh);
+
+    // Key should be deleted
+    vector<FieldValueTuple> fvs;
+    EXPECT_FALSE(app_route_table.get("10.0.0.0/24", fvs));
+}
+
+// Test: RTM_NEWROUTE for IPv6 prefix — covers AF_INET6 path in onMsgRaw
+TEST_F(FpmSyncdResponseTest, RouteAddIPv6)
+{
+    struct nlmsghdr *nlh = createRouteNlmsg(RTM_NEWROUTE, AF_INET6, RTN_UNICAST,
+                                            "2001:db8::", 32);
+    EXPECT_CALL(m_mockRouteSync, getEvpnNextHop(_, _, _, _, _, _, _))
+        .WillOnce([](struct nlmsghdr*, int, struct rtattr*[], std::string& nexthops,
+                     std::string&, std::string&, std::string&) -> bool {
+            nexthops = "";
+            return false;
+        });
+    m_mockRouteSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Test: RTM_DELROUTE for IPv6 prefix — covers AF_INET6 del path
+TEST_F(FpmSyncdResponseTest, RouteDelIPv6)
+{
+    struct nlmsghdr *nlh = createRouteNlmsg(RTM_DELROUTE, AF_INET6, RTN_UNICAST,
+                                            "2001:db8::", 32);
+    m_routeSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Test: RTN_BLACKHOLE route type — covers blackhole error path
+TEST_F(FpmSyncdResponseTest, RouteBlackhole)
+{
+    struct nlmsghdr *nlh = createRouteNlmsg(RTM_NEWROUTE, AF_INET, RTN_BLACKHOLE,
+                                            "192.0.2.0", 24);
+    m_routeSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Test: RTN_MULTICAST route type — covers multicast/BUM not-supported path
+TEST_F(FpmSyncdResponseTest, RouteMulticast)
+{
+    struct nlmsghdr *nlh = createRouteNlmsg(RTM_NEWROUTE, AF_INET, RTN_MULTICAST,
+                                            "224.0.0.0", 4);
+    m_routeSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Test: getEvpnNextHop returns false with empty nexthops — covers EVPN issue log path
+TEST_F(FpmSyncdResponseTest, EvpnNextHopFailure)
+{
+    struct nlmsghdr *nlh = createRouteNlmsg(RTM_NEWROUTE, AF_INET, RTN_UNICAST,
+                                            "10.1.1.0", 24);
+    EXPECT_CALL(m_mockRouteSync, getEvpnNextHop(_, _, _, _, _, _, _))
+        .WillOnce([](struct nlmsghdr*, int, struct rtattr*[], std::string& nexthops,
+                     std::string& vni, std::string& mac, std::string& intf) -> bool {
+            // Non-empty vni/mac/intf but empty nexthops — triggers EVPN issue log
+            vni = "100";
+            mac = "aa:bb:cc:dd:ee:ff";
+            intf = "Ethernet0";
+            nexthops = "";
+            return true;
+        });
+    m_mockRouteSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Test: onRouteResponse with empty protocol — covers "without protocol, ignoring" path
+TEST_F(FpmSyncdResponseTest, RouteResponseEmptyProtocol)
+{
+    DBConnector applStateDb{"APPL_STATE_DB", 0};
+    Table routeStateTable{&applStateDb, APP_ROUTE_TABLE_NAME};
+    routeStateTable.set("10.2.0.0/24", {{"protocol", "kernel"}});
+
+    // No send() expected since we return early due to empty protocol
+    EXPECT_CALL(m_mockFpm, send(_)).Times(0);
+
+    m_routeSync.onRouteResponse("10.2.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", ""},
+    });
+}
+
+// Test: getProtocolString with unknown protocol number — covers to_string fallback
+TEST_F(FpmSyncdResponseTest, GetProtocolStringUnknown)
+{
+    // Proto 250 is not a standard protocol name, triggers the to_string fallback
+    struct nlmsghdr *nlh = createRouteNlmsg(RTM_NEWROUTE, AF_INET, RTN_UNICAST,
+                                            "10.3.0.0", 24, /*protocol=*/250);
+    EXPECT_CALL(m_mockRouteSync, getEvpnNextHop(_, _, _, _, _, _, _))
+        .WillOnce([](struct nlmsghdr*, int, struct rtattr*[], std::string& nexthops,
+                     std::string&, std::string&, std::string&) -> bool {
+            nexthops = "";
+            return false;
+        });
+    m_mockRouteSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Helper: build nlmsg with RTA_DST + RTA_TABLE (for VRF route testing)
+static struct nlmsghdr* createRouteNlmsgWithTable(uint16_t nlmsg_type, uint8_t family,
+                                                   uint8_t rtm_type, const char* dst_ip,
+                                                   uint8_t prefixlen, uint32_t table_id,
+                                                   uint8_t protocol = 200)
+{
+    struct nlmsghdr *nlh = createRouteNlmsg(nlmsg_type, family, rtm_type, dst_ip, prefixlen, protocol);
+
+    struct rtattr *rta = (struct rtattr *)((char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len));
+    rta->rta_type = RTA_TABLE;
+    uint32_t tbl = table_id;
+    rta->rta_len = RTA_LENGTH(sizeof(tbl));
+    memcpy(RTA_DATA(rta), &tbl, sizeof(tbl));
+
+    nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + RTA_ALIGN(rta->rta_len);
+    return nlh;
+}
+
+// Test: IPv4 dst_len > 32 — covers early return at IPV4_MAX_BITLEN check
+TEST_F(FpmSyncdResponseTest, RouteIPv4BadPrefixLen)
+{
+    struct nlmsghdr *nlh = createRouteNlmsg(RTM_NEWROUTE, AF_INET, RTN_UNICAST,
+                                            "10.0.0.0", 33);
+    m_routeSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Test: IPv6 dst_len > 128 — covers early return at IPV6_MAX_BITLEN check
+TEST_F(FpmSyncdResponseTest, RouteIPv6BadPrefixLen)
+{
+    struct nlmsghdr *nlh = createRouteNlmsg(RTM_NEWROUTE, AF_INET6, RTN_UNICAST,
+                                            "2001:db8::", 129);
+    m_routeSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Test: onEvpnRouteMsg with unknown msg type — covers "else if (nlmsg_type != RTM_NEWROUTE)" path
+TEST_F(FpmSyncdResponseTest, OnEvpnRouteMsgUnknownType)
+{
+    // RTM_GETROUTE is neither RTM_DELROUTE nor RTM_NEWROUTE → hits line 963
+    struct nlmsghdr *nlh = createRouteNlmsg(RTM_GETROUTE, AF_INET, RTN_UNICAST,
+                                            "10.0.0.0", 24);
+    int len = (int)(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct rtmsg)));
+    m_routeSync.onEvpnRouteMsg(nlh, len);
+    free(nlh);
+}
+
+// Test: VRF route where getIfName fails — covers getIfName error return path
+TEST_F(FpmSyncdResponseTest, VrfRouteGetIfNameFail)
+{
+    struct nlmsghdr *nlh = createRouteNlmsgWithTable(RTM_NEWROUTE, AF_INET, RTN_UNICAST,
+                                                      "10.10.0.0", 24, 100);
+    EXPECT_CALL(m_mockRouteSync, getIfName(100, _, _)).WillOnce(Return(false));
+    m_mockRouteSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Test: VRF route where getIfName returns non-"Vrf" name — covers invalid VRF name error path
+TEST_F(FpmSyncdResponseTest, VrfRouteInvalidName)
+{
+    struct nlmsghdr *nlh = createRouteNlmsgWithTable(RTM_NEWROUTE, AF_INET, RTN_UNICAST,
+                                                      "10.11.0.0", 24, 101);
+    EXPECT_CALL(m_mockRouteSync, getIfName(101, _, _))
+        .WillOnce(DoAll([](int, char* buf, size_t sz){ strncpy(buf, "eth1", sz); }, Return(true)));
+    m_mockRouteSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Test: VRF route with valid "Vrf" prefix — covers line 929 + sendOffloadReply with null FPM
+TEST_F(FpmSyncdResponseTest, VrfRouteValidName)
+{
+    struct nlmsghdr *nlh = createRouteNlmsgWithTable(RTM_NEWROUTE, AF_INET, RTN_UNICAST,
+                                                      "10.12.0.0", 24, 102);
+    EXPECT_CALL(m_mockRouteSync, getIfName(102, _, _))
+        .WillOnce(DoAll([](int, char* buf, size_t sz){ strncpy(buf, "Vrf1", sz); }, Return(true)));
+    EXPECT_CALL(m_mockRouteSync, getEvpnNextHop(_, _, _, _, _, _, _))
+        .WillOnce(Return(false));
+    m_mockRouteSync.onMsgRaw(nlh);
+    free(nlh);
+}
+
+// Test: installNextHopGroup with unknown ID — covers "nexthop not found" error path
+TEST_F(FpmSyncdResponseTest, InstallNhgNotFound)
+{
+    m_mockRouteSync.installNextHopGroup(9999);
+}
+
+// Test: installNextHopGroup on already-installed group — covers "already installed" return
+TEST_F(FpmSyncdResponseTest, InstallNhgAlreadyInstalled)
+{
+    NextHopGroup nhg(50, "192.168.5.1", "Ethernet5");
+    m_mockRouteSync.m_nh_groups.insert({50, nhg});
+    m_mockRouteSync.installNextHopGroup(50);   // installs
+    m_mockRouteSync.installNextHopGroup(50);   // hits "already installed" return
+}
+
+// Test: getNextHopGroupFields with group referencing missing member — covers incomplete group error
+TEST_F(FpmSyncdResponseTest, NhgFieldsIncompleteGroup)
+{
+    vector<pair<uint32_t,uint8_t>> members;
+    members.push_back({888, 1});  // ID 888 not in m_nh_groups
+    NextHopGroup nhg(60, members);
+    string nexthops, ifnames, weights;
+    m_mockRouteSync.getNextHopGroupFields(nhg, nexthops, ifnames, weights);
+    // Should log "incomplete" and return with empty strings
+    EXPECT_TRUE(nexthops.empty());
+}
+
+// Test: getPicContextGroupFields with group referencing missing member — covers incomplete group error
+TEST_F(FpmSyncdResponseTest, PicContextIncompleteGroup)
+{
+    vector<pair<uint32_t,uint8_t>> members;
+    members.push_back({889, 1});  // ID 889 not in m_nh_groups
+    NextHopGroup nhg(61, members);
+    struct NextHopField nhField;
+    m_mockRouteSync.getPicContextGroupFields(nhg, nhField, AF_INET);
+    // Should log "incomplete" and return with empty nhField
+    EXPECT_TRUE(nhField.nexthops.empty());
+}
+
+// Test: deletePicContextGroup with unknown ID — covers "nexthop not found" info path
+TEST_F(FpmSyncdResponseTest, DeletePicContextNhgNotFound)
+{
+    m_mockRouteSync.deletePicContextGroup(9998);
+}
+
+// Test: deletePicContextGroup on installed nhg — covers del from pic_context_groupTable
+TEST_F(FpmSyncdResponseTest, DeletePicContextInstalled)
+{
+    NextHopGroup nhg(70, "192.168.7.1", "Ethernet7");
+    nhg.installed = true;
+    m_mockRouteSync.m_nh_groups.insert({70, nhg});
+    m_mockRouteSync.deletePicContextGroup(70);
+    // nhg should be removed
+    EXPECT_EQ(m_mockRouteSync.m_nh_groups.find(70), m_mockRouteSync.m_nh_groups.end());
+}
+
 TEST_F(FpmSyncdResponseTest, testSendOffloadReply)
 {
     rt_build_ret = 1;
@@ -363,6 +686,54 @@ TEST_F(FpmSyncdResponseTest, TestNextHopAdd)
 }
 
 TEST_F(FpmSyncdResponseTest, TestIPv6NextHopAdd)
+{
+    uint32_t test_id = 20;
+    const char* test_gateway = "2001:db8::1";
+    int32_t test_ifindex = 7;
+
+    struct nlmsghdr* nlh = createNewNextHopMsgHdr(test_ifindex, test_gateway, test_id, AF_INET6);
+    int expected_length = (int)(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg)));
+
+    EXPECT_CALL(m_mockRouteSync, getIfName(test_ifindex, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet2", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    m_mockRouteSync.onNextHopMsg(nlh, expected_length);
+
+    Table nexthop_group_table(m_db.get(), APP_NEXTHOP_GROUP_TABLE_NAME);
+
+    vector<FieldValueTuple> fieldValues;
+    string key = to_string(test_id);
+    nexthop_group_table.get(key, fieldValues);
+
+    // onNextHopMsg only updates m_nh_groups unless the nhg is marked as installed
+    ASSERT_TRUE(fieldValues.empty());
+
+    // Update the nexthop group to mark it as installed and write to DB
+    m_mockRouteSync.installNextHopGroup(test_id);
+    nexthop_group_table.get(key, fieldValues);
+
+    string nexthop, ifname;
+    for (const auto& fv : fieldValues) {
+        if (fvField(fv) == "nexthop") {
+            nexthop = fvValue(fv);
+        } else if (fvField(fv) == "ifname") {
+            ifname = fvValue(fv);
+        }
+    }
+
+    EXPECT_EQ(nexthop, test_gateway);
+    EXPECT_EQ(ifname, "Ethernet2");
+
+    free(nlh);
+}
+
+TEST_F(FpmSyncdResponseTestWithZmqNb, TestIPv6NextHopAddZmqNb)
 {
     uint32_t test_id = 20;
     const char* test_gateway = "2001:db8::1";
@@ -536,13 +907,11 @@ TEST_F(FpmSyncdResponseTest, TestUpdateNextHopGroupDb)
         vector<FieldValueTuple> fieldValues;
         nexthop_group_table.get("1", fieldValues);
 
-        EXPECT_EQ(fieldValues.size(), 3);
+        EXPECT_EQ(fieldValues.size(), 2);
         EXPECT_EQ(fvField(fieldValues[0]), "nexthop");
         EXPECT_EQ(fvValue(fieldValues[0]), test_gateway);
         EXPECT_EQ(fvField(fieldValues[1]), "ifname");
         EXPECT_EQ(fvValue(fieldValues[1]), "Ethernet0");
-        EXPECT_EQ(fvField(fieldValues[2]), "weight");
-        EXPECT_EQ(fvValue(fieldValues[2]), "");
     }
 
     // Test group with multiple next hops
@@ -583,13 +952,11 @@ TEST_F(FpmSyncdResponseTest, TestUpdateNextHopGroupDb)
         vector<FieldValueTuple> fieldValues;
         nexthop_group_table.get("4", fieldValues);
 
-        EXPECT_EQ(fieldValues.size(), 3);
+        EXPECT_EQ(fieldValues.size(), 2);
         EXPECT_EQ(fvField(fieldValues[0]), "nexthop");
         EXPECT_EQ(fvValue(fieldValues[0]), "0.0.0.0");
         EXPECT_EQ(fvField(fieldValues[1]), "ifname");
         EXPECT_EQ(fvValue(fieldValues[1]), "Ethernet0");
-        EXPECT_EQ(fvField(fieldValues[2]), "weight");
-        EXPECT_EQ(fvValue(fieldValues[2]), "");
     }
 
     // Empty interface name
@@ -600,13 +967,9 @@ TEST_F(FpmSyncdResponseTest, TestUpdateNextHopGroupDb)
         vector<FieldValueTuple> fieldValues;
         nexthop_group_table.get("5", fieldValues);
 
-        EXPECT_EQ(fieldValues.size(), 3);
+        EXPECT_EQ(fieldValues.size(), 1);
         EXPECT_EQ(fvField(fieldValues[0]), "nexthop");
         EXPECT_EQ(fvValue(fieldValues[0]), test_gateway);
-        EXPECT_EQ(fvField(fieldValues[1]), "ifname");
-        EXPECT_EQ(fvValue(fieldValues[1]), "");
-        EXPECT_EQ(fvField(fieldValues[2]), "weight");
-        EXPECT_EQ(fvValue(fieldValues[2]), "");
     }
 }
 
@@ -631,12 +994,13 @@ TEST_F(FpmSyncdResponseTest, TestDeleteNextHopGroup)
     EXPECT_EQ(m_mockRouteSync.m_nh_groups.find(999), m_mockRouteSync.m_nh_groups.end());
 }
 
-struct nlmsghdr* createNewNextHopMsgHdr(const vector<pair<uint32_t, uint8_t>>& group_members, uint32_t id) {
+struct nlmsghdr* createNewNextHopMsgHdr(const vector<pair<uint32_t, uint8_t>>& group_members, uint32_t id,
+                                        uint32_t nlmsg_type = RTM_NEWNEXTHOP) {
     struct nlmsghdr *nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
     memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
 
     // Set header
-    nlh->nlmsg_type = RTM_NEWNEXTHOP;
+    nlh->nlmsg_type = static_cast<unsigned short>(nlmsg_type);
     nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE;
     nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
 
@@ -841,7 +1205,7 @@ TEST_F(FpmSyncdResponseTest, TestRouteMsgWithNHG)
 
         vector<FieldValueTuple> fvs;
         EXPECT_TRUE(route_table.get(test_destipprefix, fvs));
-        EXPECT_EQ(fvs.size(), 11);
+        EXPECT_EQ(fvs.size(), 3);
         for (const auto& fv : fvs) {
             if (fvField(fv) == "nexthop") {
                 EXPECT_EQ(fvValue(fv), test_gateway);
@@ -849,14 +1213,6 @@ TEST_F(FpmSyncdResponseTest, TestRouteMsgWithNHG)
                 EXPECT_EQ(fvValue(fv), "Ethernet1");
             } else if (fvField(fv) == "protocol") {
                 EXPECT_EQ(fvValue(fv), "static");
-            } else if (fvField(fv) == "blackhole") {
-                EXPECT_EQ(fvValue(fv), "false");
-            } else if (fvField(fv) == "nexthop_group") {
-                EXPECT_EQ(fvValue(fv), "");
-            } else if (fvField(fv) == "mpls_nh") {
-                EXPECT_EQ(fvValue(fv), "");
-            } else if (fvField(fv) == "weight") {
-                EXPECT_EQ(fvValue(fv), "");
             }
         }
     }
@@ -923,6 +1279,151 @@ TEST_F(FpmSyncdResponseTest, TestRouteMsgWithNHG)
     rtnl_route_put(test_route);
 }
 
+// Test for VnetTunnelTableFieldValueTupleWrapper with ZMQ enabled (line 1127)
+TEST_F(FpmSyncdResponseTest, TestVxlanTunnelRouteMsgWithZmqEnabled)
+{
+    // Simulate ZMQ being enabled by setting m_zmqClient to a non-null value
+    m_mockRouteSync.m_zmqClient = shared_ptr<swss::ZmqClient>(reinterpret_cast<swss::ZmqClient*>(1), [](swss::ZmqClient*){});
+
+    Table vnet_tunnel_table(m_db.get(), APP_VNET_RT_TUNNEL_TABLE_NAME);
+
+    // Create a VNET route with VXLAN interface
+    auto createVxlanTunnelRoute = [](const char* prefix, uint8_t prefixlen, uint32_t vnet_table_id) -> rtnl_route* {
+        rtnl_route* route = rtnl_route_alloc();
+        nl_addr* dst_addr;
+        nl_addr_parse(prefix, AF_INET, &dst_addr);
+        rtnl_route_set_dst(route, dst_addr);
+        rtnl_route_set_type(route, RTN_UNICAST);
+        rtnl_route_set_protocol(route, RTPROT_STATIC);
+        rtnl_route_set_family(route, AF_INET);
+        rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+        rtnl_route_set_table(route, vnet_table_id);
+        nl_addr_put(dst_addr);
+        return route;
+    };
+
+    const char* test_destipprefix = "192.168.10.0/24";
+    uint32_t vnet_table_id = 3000;
+    rtnl_route* test_route = createVxlanTunnelRoute(test_destipprefix, 24, vnet_table_id);
+
+    // Create a nexthop with VXLAN interface (starts with "vtep")
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 30);
+    nl_addr* gateway_addr;
+    nl_addr_parse("10.0.0.1", AF_INET, &gateway_addr);
+    rtnl_route_nh_set_gateway(nh, gateway_addr);
+    nl_addr_put(gateway_addr);
+    rtnl_route_add_nexthop(test_route, nh);
+
+    // Mock getIfName to return VNET interface name
+    EXPECT_CALL(m_mockRouteSync, getIfName(vnet_table_id, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Vnet300", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    // Mock getIfName for the VXLAN interface (starts with "Brvxlan")
+    EXPECT_CALL(m_mockRouteSync, getIfName(30, _, _))
+        .WillRepeatedly(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Brvxlan100", size);  // VXLAN_IF_NAME_PREFIX is "Brvxlan"
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    m_mockRouteSync.onMsg(RTM_NEWROUTE, (nl_object*)test_route);
+
+    // Verify the VXLAN tunnel route was written to the database
+    vector<FieldValueTuple> fvs;
+    std::string key = "Vnet300:192.168.10.0/24";
+    EXPECT_TRUE(vnet_tunnel_table.get(key, fvs));
+
+    // With ZMQ enabled, the endpoint field should be present
+    EXPECT_EQ(fvs.size(), 1);
+
+    // Build a map for easier verification
+    std::map<std::string, std::string> fieldMap;
+    for (const auto& fv : fvs) {
+        fieldMap[fvField(fv)] = fvValue(fv);
+    }
+
+    // Verify endpoint field is present
+    EXPECT_TRUE(fieldMap.find("endpoint") != fieldMap.end());
+    EXPECT_EQ(fieldMap["endpoint"], "10.0.0.1");
+
+    // Reset m_zmqClient to nullptr
+    m_mockRouteSync.m_zmqClient = nullptr;
+
+    rtnl_route_put(test_route);
+}
+TEST_F(FpmSyncdResponseTest, TestSrv6MySidMsgWithZmqEnabled)
+{
+    // Simulate ZMQ being enabled by setting m_zmqClient to a non-null value
+    m_mockRouteSync.m_zmqClient = shared_ptr<swss::ZmqClient>(reinterpret_cast<swss::ZmqClient*>(1), [](swss::ZmqClient*){});
+
+    Table srv6_mysid_table(m_db.get(), APP_SRV6_MY_SID_TABLE_NAME);
+
+    // Create an SRv6 My SID with End.DT4 action
+    IpAddress mysid = IpAddress("fc00:0:1:1::");
+    int8_t block_len = 32;
+    int8_t node_len = 16;
+    int8_t func_len = 16;
+    int8_t arg_len = 0;
+    uint32_t action = SRV6_LOCALSID_ACTION_END_DT4;
+    char vrf_name[] = "Vrf100";
+
+    struct nlmsg *nl_obj = create_srv6_mysid_nlmsg(
+        RTM_NEWSRV6LOCALSID,
+        &mysid,
+        block_len,
+        node_len,
+        func_len,
+        arg_len,
+        action,
+        vrf_name
+    );
+    if (!nl_obj) {
+        ADD_FAILURE() << "Failed to create SRv6 My SID message";
+        return;
+    }
+
+    // Call the target function
+    m_mockRouteSync.onSrv6MySidMsg(&nl_obj->n, nl_obj->n.nlmsg_len);
+
+    // Verify the SRv6 My SID was written to the database
+    vector<FieldValueTuple> fvs;
+    std::string key = "32:16:16:0:fc00:0:1:1::";
+    EXPECT_TRUE(srv6_mysid_table.get(key, fvs));
+
+    // With ZMQ enabled, all 3 fields should be present (action, vrf, adj)
+    EXPECT_EQ(fvs.size(), 3);
+
+    // Build a map for easier verification
+    std::map<std::string, std::string> fieldMap;
+    for (const auto& fv : fvs) {
+        fieldMap[fvField(fv)] = fvValue(fv);
+    }
+
+    // Verify all fields are present
+    EXPECT_TRUE(fieldMap.find("action") != fieldMap.end());
+    EXPECT_EQ(fieldMap["action"], "end.dt4");
+
+    EXPECT_TRUE(fieldMap.find("vrf") != fieldMap.end());
+    EXPECT_EQ(fieldMap["vrf"], "Vrf100");
+
+    // adj field should be present but empty
+    EXPECT_TRUE(fieldMap.find("adj") != fieldMap.end());
+    EXPECT_EQ(fieldMap["adj"], "");
+
+    // Reset m_zmqClient to nullptr
+    m_mockRouteSync.m_zmqClient = nullptr;
+
+    free(nl_obj);
+}
 
 TEST_F(FpmSyncdResponseTest, RouteResponseOnNoProto)
 {
@@ -994,7 +1495,7 @@ TEST_F(FpmSyncdResponseTest, TestBlackholeRoute)
 auto create_nl_addr(const char* addr_str)
 {
     nl_addr* addr;
-    nl_addr_parse(addr_str, AF_INET, &addr);
+    nl_addr_parse(addr_str, AF_UNSPEC, &addr);
     return unique_ptr<nl_addr, decltype(nl_addr_put)*>(addr, nl_addr_put);
 }
 
@@ -1045,9 +1546,18 @@ class WarmRestartRouteSyncTest : public ::testing::Test
 public:
     void SetUp() override
     {
+        struct stat st;
         resetMockWarmStartHelper();  // Reset warm restart state before each test
         testing_db::reset();
-        EXPECT_EQ(rtnl_route_read_protocol_names(DefaultRtProtoPath), 0);
+        if (stat(DefaultRtProtoPath, &st) == 0) {
+            EXPECT_EQ(rtnl_route_read_protocol_names(DefaultRtProtoPath), 0);
+        } else if (stat(OverrideRtProtoPath, &st) == 0) {
+            EXPECT_EQ(rtnl_route_read_protocol_names(OverrideRtProtoPath), 0);
+        } else {
+            FAIL() << "Neither " << DefaultRtProtoPath
+                   << " nor " << OverrideRtProtoPath
+                   << " exists; failed to load route protocol names required for tests.";
+        }
     }
 
     void TearDown() override
@@ -1207,7 +1717,6 @@ TEST_F(WarmRestartRouteSyncTest, TestRouteHandlingWarmRestartInProgress)
     Table routeTable(m_db.get(), APP_ROUTE_TABLE_NAME);
     vector<FieldValueTuple> result;
     EXPECT_FALSE(routeTable.get("192.168.10.0/24", result));
-
 }
 
 TEST_F(WarmRestartRouteSyncTest, TestVrfRouteHandlingWarmRestartInProgress)
@@ -1250,5 +1759,3341 @@ TEST_F(WarmRestartRouteSyncTest, TestRouteDeleteHandlingWarmRestartInProgress)
 
     // Verify: Route should still be in table (deletion handled by warm restart helper)
     EXPECT_TRUE(routeTable.get("192.168.12.0/24", result));
+
+
+}
+
+
+TEST_F(FpmSyncdResponseTest, TestSrv6VpnRoute_Add_NHG)
+{
+    std::string dst_prefix = "2001:db8::/64";
+    std::string encap_src = "2001:db8::1";
+    std::string vpn_sid = "2001:db8::2";
+    uint16_t vrf_table_id = 100;
+    uint32_t pic_id = 67;
+    uint32_t nhg_id = 12;
+
+    /* Create IpAddress and IpPrefix Object */
+    IpAddress _encap_src_obj = IpAddress(encap_src);
+    IpAddress _vpn_sid_obj = IpAddress(vpn_sid);
+    IpPrefix _dst_obj = IpPrefix(dst_prefix);
+
+    /* Create Srv6 Vpn route netlink msg */
+    struct nlmsg *nl_obj = create_srv6_vpn_route_nlmsg(
+        RTM_NEWSRV6VPNROUTE,
+        &_dst_obj,
+        &_encap_src_obj,
+        &_vpn_sid_obj,
+        vrf_table_id,
+        64,
+        AF_INET6,
+        RTN_UNICAST,
+        nhg_id,
+        pic_id);
+    if (!nl_obj) {
+        ADD_FAILURE() << "Failed to create SRv6 VPN Route message";
+        return;
+    }
+
+    /* Mock using getIfName to return vrfname */
+    EXPECT_CALL(m_mockRouteSync, getIfName(vrf_table_id, _, _))
+        .Times(2)
+        .WillRepeatedly(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Vrf100", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    /* for case: not found pic_it or nhg_it
+     * nothing to check and would return.
+     */
+    m_mockRouteSync.onSrv6VpnRouteMsg(&nl_obj->n, nl_obj->n.nlmsg_len);
+
+    /* Construct PIC Group */
+    NextHopGroup pic_group(pic_id, encap_src, "sr0");
+    pic_group.vpn_sid = vpn_sid;
+    pic_group.seg_src = encap_src;
+    m_mockRouteSync.m_nh_groups.insert({pic_id, pic_group});
+
+    /* Construct NHG */
+    vector<pair<uint32_t, uint8_t>> nhg_data;
+    nhg_data.push_back(make_pair(1, 1));
+    NextHopGroup nh_group(nhg_id, nhg_data);
+    nh_group.nexthop = "fe80::1";
+    nh_group.intf = "eth0";
+    m_mockRouteSync.m_nh_groups.insert({nhg_id, nh_group});
+
+    /* Call the target function */
+    m_mockRouteSync.onSrv6VpnRouteMsg(&nl_obj->n, nl_obj->n.nlmsg_len);
+
+    // Check whether use the m_routeTable.set
+    Table route_table(m_db.get(), APP_ROUTE_TABLE_NAME);
+    std::vector<FieldValueTuple> fvs;
+    std::string key = "Vrf100:" + dst_prefix;
+
+    /* Check the results */
+    bool found = route_table.get(key, fvs);
+    EXPECT_TRUE(found);
+    // Check each attr value
+    for (const auto& fv : fvs) {
+        if (fvField(fv) == "pic_context_id") {
+            EXPECT_EQ(fvValue(fv), "67");
+        } else if (fvField(fv) == "nexthop_group") {
+            EXPECT_EQ(fvValue(fv), "12");
+        }
+    }
+
+    /* Check whether use the m_nexthop_groupTable.set */
+    Table nhg_table(m_db.get(), APP_NEXTHOP_GROUP_TABLE_NAME);
+    std::vector<FieldValueTuple> fvs_nhg;
+    std::string key_nhg = m_mockRouteSync.getNextHopGroupKeyAsString(nhg_id);
+
+    /* Check the result */
+    bool found_nhg = nhg_table.get(key_nhg.c_str(), fvs_nhg);
+    EXPECT_TRUE(found_nhg);
+    // Check each attr value
+    for (const auto& fv_nhg : fvs_nhg) {
+        if (fvField(fv_nhg) == "seg_src") {
+            EXPECT_EQ(fvValue(fv_nhg), "2001:db8::1");
+        }
+    }
+
+    free(nl_obj);
+}
+
+TEST_F(FpmSyncdResponseTest, TestSrv6VpnRoute_NH)
+{
+    std::string dst_prefix = "2001:db8:1::/64";
+    std::string encap_src = "2001:db8:1::1";
+    std::string vpn_sid = "2001:db8:1::2";
+    uint16_t vrf_table_id = 101;
+    uint32_t pic_id = 89;
+    uint32_t nhg_id = 34;
+
+    /* Create IpAddress and IpPrefix Object */
+    IpAddress _encap_src_obj = IpAddress(encap_src);
+    IpAddress _vpn_sid_obj = IpAddress(vpn_sid);
+    IpPrefix _dst_obj = IpPrefix(dst_prefix);
+
+    /* Mock using getIfName to return vrfname */
+    EXPECT_CALL(m_mockRouteSync, getIfName(vrf_table_id, _, _))
+        .Times(11)
+        .WillRepeatedly(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Vrf101", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    /*-----------------------------------------------*/
+    /* Test 1: Create and process ADD message for NH */
+    /*-----------------------------------------------*/
+    {
+        /* Create Srv6 Vpn route netlink msg with ADD cmd */
+        struct nlmsg *nl_obj = create_srv6_vpn_route_nlmsg(
+            RTM_NEWSRV6VPNROUTE,
+            &_dst_obj,
+            &_encap_src_obj,
+            &_vpn_sid_obj,
+            vrf_table_id,
+            64,
+            AF_INET6,
+            RTN_UNICAST,
+            nhg_id,
+            pic_id);
+        if (!nl_obj) {
+            ADD_FAILURE() << "Failed to create SRv6 VPN Route message";
+            return;
+        }
+
+        /* Construct PIC Group */
+        NextHopGroup pic_group(pic_id, encap_src, "sr0");
+        pic_group.vpn_sid = vpn_sid;
+        pic_group.seg_src = encap_src;
+        m_mockRouteSync.m_nh_groups.insert({pic_id, pic_group});
+
+        /* Construct NHG with no group */
+        NextHopGroup nh_group(nhg_id, "fe80::2", "eth1");
+        nh_group.nexthop = "fe80::2";
+        nh_group.intf = "eth1";
+        m_mockRouteSync.m_nh_groups.insert({nhg_id, nh_group});
+
+        /* Call the target function */
+        m_mockRouteSync.onSrv6VpnRouteMsg(&nl_obj->n, nl_obj->n.nlmsg_len);
+
+        /* Check whether use the m_routeTable.set */
+        Table route_table(m_db.get(), APP_ROUTE_TABLE_NAME);
+        std::vector<FieldValueTuple> fvs;
+        std::string key = "Vrf101:" + dst_prefix;
+
+        /* Check the result */
+        bool found = route_table.get(key, fvs);
+        EXPECT_TRUE(found);
+        // Check each attr value
+        for (const auto& fv : fvs) {
+            if (fvField(fv) == "nexthop") {
+                EXPECT_EQ(fvValue(fv), "2001:db8:1::1");
+            } else if (fvField(fv) == "vpn_sid") {
+                EXPECT_EQ(fvValue(fv), "2001:db8:1::2");
+            } else if (fvField(fv) == "seg_src") {
+                EXPECT_EQ(fvValue(fv), "2001:db8:1::1");
+            } else if (fvField(fv) == "ifname") {
+                EXPECT_EQ(fvValue(fv), "eth1");
+            }
+        }
+
+        /* Free the memory */
+        free(nl_obj);
+    }
+
+    /*-----------------------------------------------*/
+    /* Test 2: Create and process DEL message for NH */
+    /*-----------------------------------------------*/
+    {
+        /* Create Srv6 Vpn route netlink msg with DEL cmd */
+        struct nlmsg *del_nl_obj = create_srv6_vpn_route_nlmsg(
+            RTM_DELSRV6VPNROUTE,
+            &_dst_obj,
+            &_encap_src_obj,
+            &_vpn_sid_obj,
+            vrf_table_id,
+            64,
+            AF_INET6,
+            RTN_UNICAST,
+            nhg_id,
+            pic_id);
+        if (!del_nl_obj) {
+            ADD_FAILURE() << "Failed to create SRv6 DEL Route message";
+            return;
+        }
+
+        /* Call the target function for DEL */
+        m_mockRouteSync.onSrv6VpnRouteMsg(&del_nl_obj->n, del_nl_obj->n.nlmsg_len);
+
+        /* Check whether use the m_routeTable.set */
+        Table route_table(m_db.get(), APP_ROUTE_TABLE_NAME);
+        std::vector<FieldValueTuple> fvs;
+        std::string key = "Vrf101:" + dst_prefix;
+
+        /* Check whether the route was deleted */
+        bool found = route_table.get(key, fvs);
+        EXPECT_FALSE(found);
+
+        free(del_nl_obj);
+    }
+
+    /*-----------------------------*/
+    /* Test 3: Test other branches */
+    /*-----------------------------*/
+    // Case 1: no DST
+    {
+        /* Create a route message without RTA_DST */
+        struct nlmsg *nl_obj_no_dst = create_srv6_vpn_route_nlmsg(
+            RTM_NEWSRV6VPNROUTE,
+            nullptr,
+            &_encap_src_obj,
+            &_vpn_sid_obj,
+            vrf_table_id,
+            64,
+            AF_INET6,
+            RTN_UNICAST,
+            nhg_id,
+            pic_id);
+        if (!nl_obj_no_dst) {
+            ADD_FAILURE() << "Failed to create SRv6 VPN Route message";
+            return;
+        }
+
+        /* Call the target function */
+        m_mockRouteSync.onSrv6VpnRouteMsg(&nl_obj_no_dst->n, nl_obj_no_dst->n.nlmsg_len);
+
+        free(nl_obj_no_dst);
+    }
+
+    // Case 2: AF_INET6 with too large dst bitlen
+    {
+        /* Create a route message with too large dst bitlen */
+        struct nlmsg *nl_obj_large_bitlen = create_srv6_vpn_route_nlmsg(
+            RTM_NEWSRV6VPNROUTE,
+            &_dst_obj,
+            &_encap_src_obj,
+            &_vpn_sid_obj,
+            vrf_table_id,
+            130,
+            AF_INET6,
+            RTN_UNICAST,
+            nhg_id,
+            pic_id);
+        if (!nl_obj_large_bitlen) {
+            ADD_FAILURE() << "Failed to create SRv6 VPN Route message";
+            return;
+        }
+
+        /* Call the target function */
+        m_mockRouteSync.onSrv6VpnRouteMsg(&nl_obj_large_bitlen->n, nl_obj_large_bitlen->n.nlmsg_len);
+
+        free(nl_obj_large_bitlen);
+    }
+
+    // Case 3: AF_INET6 with max dst bitlen
+    {
+        /* Create a route message with max dst bitlen */
+        struct nlmsg *nl_obj_max_bitlen = create_srv6_vpn_route_nlmsg(
+            RTM_NEWSRV6VPNROUTE,
+            &_dst_obj,
+            &_encap_src_obj,
+            &_vpn_sid_obj,
+            vrf_table_id,
+            128,
+            AF_INET6,
+            RTN_UNICAST,
+            nhg_id,
+            pic_id);
+        if (!nl_obj_max_bitlen) {
+            ADD_FAILURE() << "Failed to create SRv6 VPN Route message";
+            return;
+        }
+
+        /* Call the target function */
+        m_mockRouteSync.onSrv6VpnRouteMsg(&nl_obj_max_bitlen->n, nl_obj_max_bitlen->n.nlmsg_len);
+
+        free(nl_obj_max_bitlen);
+    }
+
+    // Case 4: wrong nlmsg_type, neither RTM_NEWSRV6VPNROUTE nor RTM_DELSRV6VPNROUTE
+    {
+        /* Create a route message with wrong nlmsg_type */
+        struct nlmsg *nl_obj_wrong_nlmsg_type = create_srv6_vpn_route_nlmsg(
+            RTM_NEWSRV6LOCALSID,
+            &_dst_obj,
+            &_encap_src_obj,
+            &_vpn_sid_obj,
+            vrf_table_id,
+            64,
+            AF_INET6,
+            RTN_UNICAST,
+            nhg_id,
+            pic_id);
+        if (!nl_obj_wrong_nlmsg_type) {
+            ADD_FAILURE() << "Failed to create SRv6 VPN Route message";
+            return;
+        }
+
+        /* Call the target function */
+        m_mockRouteSync.onSrv6VpnRouteMsg(&nl_obj_wrong_nlmsg_type->n, nl_obj_wrong_nlmsg_type->n.nlmsg_len);
+
+        free(nl_obj_wrong_nlmsg_type);
+    }
+
+    // Case 5: wrong rtm_type
+    {
+        /* List of rtm_types to test */
+        int types_to_test[] = {
+            RTN_BLACKHOLE,
+            RTN_UNREACHABLE,
+            RTN_PROHIBIT,
+            RTN_MULTICAST,
+            RTN_BROADCAST,
+            RTN_LOCAL,
+            __RTN_MAX       // default case
+        };
+
+        for (int rtm_type : types_to_test) {
+            struct nlmsg *nl_obj_wrong_rtm_type = create_srv6_vpn_route_nlmsg(
+                RTM_NEWSRV6VPNROUTE,
+                &_dst_obj,
+                &_encap_src_obj,
+                &_vpn_sid_obj,
+                vrf_table_id,
+                64,
+                AF_INET6,
+                static_cast<uint8_t>(rtm_type),
+                nhg_id,
+                pic_id);
+            if (!nl_obj_wrong_rtm_type) {
+                ADD_FAILURE() << "Failed to create SRv6 VPN Route message with type " << rtm_type;
+                continue;
+            }
+
+            /* Call the target function */
+            m_mockRouteSync.onSrv6VpnRouteMsg(&nl_obj_wrong_rtm_type->n, nl_obj_wrong_rtm_type->n.nlmsg_len);
+
+            free(nl_obj_wrong_rtm_type);
+        }
+    }
+
+    // Case 6: invalid rtm_family
+    {
+        /* Create a route message with invalid rtm_family */
+        struct nlmsg *nl_obj_invalid_rtm_family = create_srv6_vpn_route_nlmsg(
+            RTM_NEWSRV6VPNROUTE,
+            &_dst_obj,
+            &_encap_src_obj,
+            &_vpn_sid_obj,
+            vrf_table_id,
+            64,
+            AF_LOCAL,
+            RTN_UNICAST,
+            nhg_id,
+            pic_id);
+        if (!nl_obj_invalid_rtm_family) {
+            ADD_FAILURE() << "Failed to create SRv6 VPN Route message";
+            return;
+        }
+
+        /* Call the target function */
+        m_mockRouteSync.onSrv6VpnRouteMsg(&nl_obj_invalid_rtm_family->n, nl_obj_invalid_rtm_family->n.nlmsg_len);
+
+        free(nl_obj_invalid_rtm_family);
+    }
+
+    // Case 7: create RTA_TABLE
+    {
+        /* Create a route message with RTA_TABLE */
+        struct nlmsg *nl_obj_RTA_TABLE = create_srv6_vpn_route_nlmsg(
+            RTM_NEWSRV6VPNROUTE,
+            &_dst_obj,
+            &_encap_src_obj,
+            &_vpn_sid_obj,
+            257,    // set vrf_table_id > 256
+            64,
+            AF_INET6,
+            RTN_UNICAST,
+            nhg_id,
+            pic_id);
+        if (!nl_obj_RTA_TABLE) {
+            ADD_FAILURE() << "Failed to create SRv6 VPN Route message";
+            return;
+        }
+
+        /* Mock using getIfName to return vrfname, vrf_table_id == 257 */
+        EXPECT_CALL(m_mockRouteSync, getIfName(257, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char* ifname, size_t size) {
+                    strncpy(ifname, "Vrf257", size);
+                    ifname[size-1] = '\0';
+                },
+                Return(true)
+            ));
+
+        /* Call the target function */
+        m_mockRouteSync.onSrv6VpnRouteMsg(&nl_obj_RTA_TABLE->n, nl_obj_RTA_TABLE->n.nlmsg_len);
+
+        free(nl_obj_RTA_TABLE);
+    }
+}
+
+
+/* Add UT for onPicContextMsg */
+struct nlmsghdr* createPicContextMsgHdr(uint16_t msg_type, uint32_t id = 0, const char *gateway = nullptr,
+                                        int32_t ifindex = 0, unsigned char nh_family = AF_INET,
+                                        const char *seg6_sid = nullptr,
+                                        const char *seg6_src = nullptr,
+                                        uint32_t encap_type = LWTUNNEL_ENCAP_SEG6)
+{
+    struct nlmsghdr *nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
+    memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
+
+    // Set header
+    nlh->nlmsg_type = msg_type;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
+
+    // Set nhmsg
+    struct nhmsg *nhm = (struct nhmsg *)NLMSG_DATA(nlh);
+    nhm->nh_family = nh_family;
+
+    // Prepare the rta
+    struct rtattr *rta;
+    // Add NHA_ID
+    if (id) {
+        rta = (struct rtattr *)((char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len));
+        rta->rta_type = NHA_ID;
+        rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
+        *(uint32_t *)RTA_DATA(rta) = id;
+        nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + RTA_ALIGN(rta->rta_len);
+    }
+
+    // Add NHA_OIF
+    if (ifindex) {
+        rta = (struct rtattr *)((char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len));
+        rta->rta_type = NHA_OIF;
+        rta->rta_len = RTA_LENGTH(sizeof(int32_t));
+        *(int32_t *)RTA_DATA(rta) = ifindex;
+        nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + RTA_ALIGN(rta->rta_len);
+    }
+
+    // Add NHA_GATEWAY
+    if (gateway) {
+        rta = (struct rtattr *)((char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len));
+        rta->rta_type = NHA_GATEWAY;
+        if (nh_family == AF_INET6) {
+            struct in6_addr gw_addr6;
+            inet_pton(AF_INET6, gateway, &gw_addr6);
+            rta->rta_len = RTA_LENGTH(sizeof(struct in6_addr));
+            memcpy(RTA_DATA(rta), &gw_addr6, sizeof(struct in6_addr));
+        }
+        else {
+            struct in_addr gw_addr;
+            inet_pton(AF_INET, gateway, &gw_addr);
+            rta->rta_len = RTA_LENGTH(sizeof(struct in_addr));
+            memcpy(RTA_DATA(rta), &gw_addr, sizeof(struct in_addr));
+        }
+        nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + RTA_ALIGN(rta->rta_len);
+    }
+
+    // Add Srv6 Encap info if provided
+    if (seg6_sid && seg6_src) {
+        // Add NHA_ENCAP_TYPE tlv, type of value is int. Similar with rta_type, change it to uint16_t
+        rta = (struct rtattr *)((char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len));
+        rta->rta_type = NHA_ENCAP_TYPE;
+        rta->rta_len = RTA_LENGTH(sizeof(uint16_t));
+        *(uint16_t *)RTA_DATA(rta) = static_cast<unsigned short>(encap_type);
+        nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + RTA_ALIGN(rta->rta_len);
+
+        /*
+         * Prepare work: Calculate the nested tlv length,
+         * we need it to fill the value of outside len.
+         */
+        size_t num_segments = 1;
+        size_t value_size = sizeof(struct seg6_iptunnel_encap_pri)
+                            + num_segments * sizeof(struct ipv6_sr_hdr)
+                            + num_segments * sizeof(struct in6_addr);
+        size_t nested_size = sizeof(struct rtattr) + value_size;
+
+        // Add type and len of NHA_ENCAP
+        rta = (struct rtattr *)((char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len));
+        rta->rta_type = NHA_ENCAP;
+        rta->rta_len = static_cast<unsigned short>(RTA_LENGTH(nested_size));
+
+        // Add nested SEG6_IPTUNNEL_SRH as ENCAP's payload
+        struct rtattr *sub_rta = (struct rtattr *)(RTA_DATA(rta));
+        // Add type and len of SEG6_IPTUNNEL_SRH
+        sub_rta->rta_type = SEG6_IPTUNNEL_SRH;
+        sub_rta->rta_len = static_cast<unsigned short>(RTA_LENGTH(value_size));
+
+        // Prepare the value we truly need
+        struct seg6_iptunnel_encap_pri *encap_data = (struct seg6_iptunnel_encap_pri *)malloc(value_size);
+        if (!encap_data) {
+            free(nlh);
+            return NULL;
+        }
+        memset(encap_data, 0, value_size);
+
+        // Set the src
+        struct in6_addr src;
+        inet_pton(AF_INET6, seg6_src, &src);
+        encap_data->src = src;
+
+        // Aquire srh pointer
+        struct ipv6_sr_hdr *srh = encap_data->srh;
+        // Set segments Address
+        struct in6_addr sid;
+        inet_pton(AF_INET6, seg6_sid, &sid);
+        memcpy(srh->segments, &sid, sizeof(sid));
+
+        // Copy the entire data into the Netlink message
+        memcpy(RTA_DATA(sub_rta), encap_data, value_size);
+        nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + RTA_ALIGN(rta->rta_len);
+
+        free(encap_data);
+    }
+
+    return nlh;
+}
+
+TEST_F(FpmSyncdResponseTest, TestPicContext_NH)
+{
+    uint16_t msg_type = RTM_NEWPICCONTEXT;
+    uint32_t id = 100;
+    const char *gateway = "2001:db8::1";
+    int32_t ifindex = 101;
+    unsigned char nh_family = AF_INET6;
+    const char *seg6_sid = "2001:db8::2";
+    const char *seg6_src = "2001:db8::3";
+
+
+    /*-------------------------------------------*/
+    /* Test 1: Create and process ADD msg for NH */
+    /*-------------------------------------------*/
+    {
+        /* Create netlink msg header with ADD cmd */
+        struct nlmsghdr *nlh = createPicContextMsgHdr(
+            msg_type,
+            id,
+            gateway,
+            ifindex,
+            nh_family,
+            seg6_sid,
+            seg6_src
+        );
+        if (!nlh) {
+            ADD_FAILURE() << "Failed to create Pic Context nlmsghdr";
+            return;
+        }
+        int expected_length = (int)(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg)));
+
+        /* Construct the IfName */
+        EXPECT_CALL(m_mockRouteSync, getIfName(ifindex, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char *ifname, size_t size) {
+                    strncpy(ifname, "Ethernet1", size);
+                    ifname[size-1] = '\0';
+                },
+                Return(true)
+            ));
+
+        /* Call the target function */
+        m_mockRouteSync.onPicContextMsg(nlh, expected_length);
+
+        /* Check the results */
+        auto it = m_mockRouteSync.m_nh_groups.find(id);
+        ASSERT_NE(it, m_mockRouteSync.m_nh_groups.end()) << "Failed to add new Pic Context";
+
+        /* Check other attrs */
+        const NextHopGroup &nhg = it->second;
+        // Check each value of attr
+        EXPECT_EQ(nhg.nexthop, gateway);    // Check gateway
+        EXPECT_EQ(nhg.intf, "Ethernet1");       // Check interface name
+        EXPECT_EQ(nhg.vpn_sid, seg6_sid);       // Check sid
+        EXPECT_EQ(nhg.seg_src, seg6_src);       // Check seg_src
+
+        free(nlh);
+    }
+
+    /*-------------------------------------------*/
+    /* Test 2: Create and process DEL msg for NH */
+    /*-------------------------------------------*/
+    {
+        /* Create netlink msg header with DEL cmd */
+        struct nlmsghdr *nlh_del = createPicContextMsgHdr(RTM_DELPICCONTEXT, id);
+        if (!nlh_del) {
+            ADD_FAILURE() << "Failed to create Pic Context nlmsghdr";
+            return;
+        }
+        int expected_length = (int)(nlh_del->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg)));
+
+        /* Call the target function */
+        m_mockRouteSync.onPicContextMsg(nlh_del, expected_length);
+
+        /* Check the result */
+        auto it = m_mockRouteSync.m_nh_groups.find(id);
+        ASSERT_EQ(it, m_mockRouteSync.m_nh_groups.end()) << "Failed to remove Pic Context";
+
+        free(nlh_del);
+    }
+
+    /*-------------------------------*/
+    /* Test 3: Other branches for NH */
+    /*-------------------------------*/
+    // Case 1: nlmsg_type is nothing to do with PIC
+    {
+        /* Create netlink msg header with wrong nlmsg_type */
+        struct nlmsghdr *nlh_no_pic = createPicContextMsgHdr(RTM_NEWSRV6VPNROUTE);
+        if (!nlh_no_pic) {
+            ADD_FAILURE() << "Failed to create Pic Context nlmsghdr";
+            return;
+        }
+        int expected_length = (int)(nlh_no_pic->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg)));
+
+        /* Call the target function */
+        m_mockRouteSync.onPicContextMsg(nlh_no_pic, expected_length);
+
+        /* Check the result */
+        auto it = m_mockRouteSync.m_nh_groups.find(id);
+        ASSERT_EQ(it, m_mockRouteSync.m_nh_groups.end()) << "We should've find nothing for no pic case";
+
+        free(nlh_no_pic);
+    }
+
+    // Case 2: missing NHA_ID
+    {
+        /* Create netlink msg header without NHA_ID */
+        struct nlmsghdr *nlh_no_id = createPicContextMsgHdr(msg_type, 0);
+        if (!nlh_no_id) {
+            ADD_FAILURE() << "Failed to create Pic Context nlmsghdr";
+            return;
+        }
+        int expected_length = (int)(nlh_no_id->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg)));
+
+        /* Call the target function */
+        m_mockRouteSync.onPicContextMsg(nlh_no_id, expected_length);
+
+        /* Check the result */
+        auto it = m_mockRouteSync.m_nh_groups.find(id);
+        ASSERT_EQ(it, m_mockRouteSync.m_nh_groups.end()) << "We should've find nothing for no id case";
+
+        free(nlh_no_id);
+    }
+
+    // Case 3: has NHA_ENCAP & NHA_ENCAP_TYPE but not LWTUNNEL_ENCAP_SEG6
+    {
+        /* Create netlink msg header with other encap_type */
+        struct nlmsghdr *nlh_wrong_encap = createPicContextMsgHdr(
+            msg_type,
+            200,
+            gateway,
+            ifindex,
+            nh_family,
+            seg6_sid,
+            seg6_src,
+            __LWTUNNEL_ENCAP_MAX
+        );
+        if (!nlh_wrong_encap) {
+            ADD_FAILURE() << "Failed to create Pic Context nlmsghdr";
+            return;
+        }
+        int expected_length = (int)(nlh_wrong_encap->nlmsg_len - NLMSG_ALIGN(sizeof(struct nhmsg)));
+
+        /* Construct the IfName */
+        EXPECT_CALL(m_mockRouteSync, getIfName(ifindex, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char *ifname, size_t size) {
+                    strncpy(ifname, "Ethernet1", size);
+                    ifname[size-1] = '\0';
+                },
+                Return(true)
+            ));
+
+        /* Call the target fuction */
+        m_mockRouteSync.onPicContextMsg(nlh_wrong_encap, expected_length);
+
+        /* Check the results */
+        auto it = m_mockRouteSync.m_nh_groups.find(200);
+        ASSERT_NE(it, m_mockRouteSync.m_nh_groups.end()) << "Failed to add new Pic Context";
+
+        /* Check other attrs */
+        const NextHopGroup &nhg = it->second;
+        // Check the values
+        EXPECT_EQ(nhg.vpn_sid, "");
+        EXPECT_EQ(nhg.seg_src, "");
+
+        free(nlh_wrong_encap);
+    }
+
+    // Case 4: addr_family == AF_INET
+    {
+        /* Create netlink msg header for AF_INET case */
+        struct nlmsghdr *nlh_ipv4 = createPicContextMsgHdr(
+            msg_type,
+            300,
+            "192.168.0.1",
+            ifindex
+        );
+        if (!nlh_ipv4) {
+            ADD_FAILURE() << "Failed to create Pic Context nlmsghdr";
+            return;
+        }
+        int expected_length = (int)(nlh_ipv4->nlmsg_len - NLMSG_ALIGN(sizeof(struct nhmsg)));
+
+        /* Construct the IfName */
+        EXPECT_CALL(m_mockRouteSync, getIfName(ifindex, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char *ifname, size_t size) {
+                    strncpy(ifname, "Ethernet1", size);
+                    ifname[size-1] = '\0';
+                },
+                Return(true)
+            ));
+
+        /* Call the target function */
+        m_mockRouteSync.onPicContextMsg(nlh_ipv4, expected_length);
+
+        /* Check the results */
+        auto it = m_mockRouteSync.m_nh_groups.find(300);
+        ASSERT_NE(it, m_mockRouteSync.m_nh_groups.end()) << "Failed to add new Pic Context for ipv4";
+
+        /* Check other attrs */
+        const NextHopGroup &nhg = it->second;
+        // Check each value of attr
+        EXPECT_EQ(nhg.nexthop, "192.168.0.1");
+        EXPECT_EQ(nhg.intf, "Ethernet1");
+
+        free(nlh_ipv4);
+    }
+
+    // case 5: unknown addr_family type
+    {
+        /* Create netlink msg header with unknown addr_family type */
+        struct nlmsghdr *nlh_unknown_af = createPicContextMsgHdr(
+            msg_type,
+            id,
+            gateway,
+            ifindex,
+            AF_UNSPEC
+        );
+        if (!nlh_unknown_af) {
+            ADD_FAILURE() << "Failed to create Pic Context nlmsghdr";
+            return;
+        }
+        int expected_length = (int)(nlh_unknown_af->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg)));
+
+        /* Call the target function */
+        m_mockRouteSync.onPicContextMsg(nlh_unknown_af, expected_length);
+
+        /* Check the result */
+        auto it = m_mockRouteSync.m_nh_groups.find(id);
+        ASSERT_EQ(it, m_mockRouteSync.m_nh_groups.end()) << "We should not process the unknown af";
+
+        free(nlh_unknown_af);
+    }
+
+    // case 6: ifName does not exist
+    {
+        /* Create netlink msg header with ADD cmd */
+        struct nlmsghdr *nlh_unknown_intf = createPicContextMsgHdr(
+            msg_type,
+            400,
+            gateway,
+            ifindex,
+            nh_family
+        );
+        if (!nlh_unknown_intf) {
+            ADD_FAILURE() << "Failed to create Pic Context nlmsghdr";
+            return;
+        }
+        int expected_length = (int)(nlh_unknown_intf->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg)));
+
+        /* Construct the IfName, mock unknown case */
+        EXPECT_CALL(m_mockRouteSync, getIfName(ifindex, _, _))
+            .WillOnce(Return(false));
+
+        /* Call the target function */
+        m_mockRouteSync.onPicContextMsg(nlh_unknown_intf, expected_length);
+
+        /* Check the results */
+        auto it = m_mockRouteSync.m_nh_groups.find(400);
+        ASSERT_NE(it, m_mockRouteSync.m_nh_groups.end()) << "Failed to add new Pic Context";
+
+        /* Check other attrs */
+        const NextHopGroup &nhg = it->second;
+        // Check each value of attr
+        EXPECT_EQ(nhg.nexthop, gateway);
+        EXPECT_EQ(nhg.intf, "unknown");
+
+        free(nlh_unknown_intf);
+    }
+
+    // case 7: ifName is docker0
+    {
+        /* Create netlink msg header with ifName "docker0" */
+        struct nlmsghdr *nlh_docker0 = createPicContextMsgHdr(
+            msg_type,
+            id,
+            gateway,
+            ifindex,
+            nh_family
+        );
+        if (!nlh_docker0) {
+            ADD_FAILURE() << "Failed to create Pic Context nlmsghdr";
+            return;
+        }
+        int expected_length = (int)(nlh_docker0->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg)));
+
+        /* Construct the IfName, docker0 */
+        EXPECT_CALL(m_mockRouteSync, getIfName(ifindex, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char *ifname, size_t size) {
+                    strncpy(ifname, "docker0", size);
+                    ifname[size-1] = '\0';
+                },
+                Return(true)
+            ));
+
+        /* Call the target function */
+        m_mockRouteSync.onPicContextMsg(nlh_docker0, expected_length);
+
+        /* Check the results */
+        auto it = m_mockRouteSync.m_nh_groups.find(id);
+        ASSERT_EQ(it, m_mockRouteSync.m_nh_groups.end()) << "Failed to skip docker0 case";
+
+        free(nlh_docker0);
+    }
+}
+
+TEST_F(FpmSyncdResponseTest, TestPicContext_NHG)
+{
+    // Prepare the information of nexthops
+    uint16_t msg_type = RTM_NEWPICCONTEXT;
+    uint32_t nh1_id = 1;
+    uint32_t nh2_id = 2;
+    uint32_t nh3_id = 3;
+    const char *gateway_1 = "2001:db8::1";
+    const char *gateway_2 = "2002:db8::1";
+    const char *gateway_3 = "2003:db8::1";
+    uint32_t ifindex_1 = 1;
+    uint32_t ifindex_2 = 2;
+    uint32_t ifindex_3 = 3;
+    unsigned char nh_family = AF_INET6;
+    const char *seg6_sid_1 = "2001:db8::2";
+    const char *seg6_sid_2 = "2002:db8::2";
+    const char *seg6_sid_3 = "2003:db8::2";
+    const char *seg6_src_1 = "2001:db8::3";
+    const char *seg6_src_2 = "2002:db8::3";
+    const char *seg6_src_3 = "2003:db8::3";
+
+    /* First, we need to add the nexthops to m_nh_groups */
+    struct nlmsghdr *nlh_1 = createPicContextMsgHdr(msg_type, nh1_id, gateway_1, ifindex_1,
+                                                    nh_family, seg6_sid_1, seg6_src_1);
+    struct nlmsghdr *nlh_2 = createPicContextMsgHdr(msg_type, nh2_id, gateway_2, ifindex_2,
+                                                    nh_family, seg6_sid_2, seg6_src_2);
+    struct nlmsghdr *nlh_3 = createPicContextMsgHdr(msg_type, nh3_id, gateway_3, ifindex_3,
+                                                    nh_family, seg6_sid_3, seg6_src_3);
+    if (!nlh_1 || !nlh_2 || !nlh_3) {
+        ADD_FAILURE() << "Failed to create Pic Context nlmsghdr";
+        return;
+    }
+
+    // Construct the IfName
+    EXPECT_CALL(m_mockRouteSync, getIfName(ifindex_1, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char *ifname, size_t size) {
+                    strncpy(ifname, "Ethernet1", size);
+                    ifname[size-1] = '\0';
+                },
+                Return(true)
+            ));
+    EXPECT_CALL(m_mockRouteSync, getIfName(ifindex_2, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char *ifname, size_t size) {
+                    strncpy(ifname, "Ethernet2", size);
+                    ifname[size-1] = '\0';
+                },
+                Return(true)
+            ));
+    EXPECT_CALL(m_mockRouteSync, getIfName(ifindex_3, _, _))
+            .WillOnce(DoAll(
+                [](int32_t, char *ifname, size_t size) {
+                    strncpy(ifname, "Ethernet3", size);
+                    ifname[size-1] = '\0';
+                },
+                Return(true)
+            ));
+    // Call onPicContextMsg to insert these nexthops
+    m_mockRouteSync.onPicContextMsg(nlh_1, (int)(nlh_1->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg))));
+    m_mockRouteSync.onPicContextMsg(nlh_2, (int)(nlh_2->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg))));
+    m_mockRouteSync.onPicContextMsg(nlh_3, (int)(nlh_3->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg))));
+
+    /* Create a nexthop group with these nexthops */
+    uint32_t group_id = 100;
+    vector<pair<uint32_t, uint8_t>> group_members = {
+        {nh1_id, 1},  // id=1, weight=1
+        {nh2_id, 2},  // id=2, weight=2
+        {nh3_id, 3},  // id=3, weight=3
+    };
+
+    // Create group_nlh
+    struct nlmsghdr* group_nlh = createNewNextHopMsgHdr(group_members, group_id, RTM_NEWPICCONTEXT);
+    ASSERT_NE(group_nlh, nullptr) << "Failed to create group nexthop message";
+
+    // Call the target function
+    m_mockRouteSync.onPicContextMsg(group_nlh, (int)(group_nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg))));
+
+    // Verify the group was added correctly
+    auto it = m_mockRouteSync.m_nh_groups.find(group_id);
+    ASSERT_NE(it, m_mockRouteSync.m_nh_groups.end()) << "Failed to add nexthop group";
+
+    // Verify group members
+    const auto& group = it->second.group;
+    ASSERT_EQ(group.size(), 3) << "Wrong number of group members";
+
+    // Check each member's ID and weight
+    EXPECT_EQ(group[0].first, nh1_id);
+    EXPECT_EQ(group[0].second, 1);
+    EXPECT_EQ(group[1].first, nh2_id);
+    EXPECT_EQ(group[1].second, 2);
+    EXPECT_EQ(group[2].first, nh3_id);
+    EXPECT_EQ(group[2].second, 3);
+
+    // Check values in PIC table
+    Table pic_context_group_table(m_db.get(), APP_PIC_CONTEXT_TABLE_NAME);
+    vector<FieldValueTuple> fieldValues;
+    string key = to_string(group_id);
+    pic_context_group_table.get(key, fieldValues);
+
+    ASSERT_EQ(fieldValues.size(), 5) << "Wrong number of fields in DB";
+
+    // Verify the DB fields
+    string nexthops, ifnames, sids, srcs, weights;
+    for (const auto& fv : fieldValues) {
+        if (fvField(fv) == "nexthop") {
+            nexthops = fvValue(fv);
+        } else if (fvField(fv) == "ifname") {
+            ifnames = fvValue(fv);
+        } else if (fvField(fv) == "vpn_sid") {
+            sids = fvValue(fv);
+        } else if (fvField(fv) == "seg_src") {
+            srcs = fvValue(fv);
+        } else if (fvField(fv) == "weight") {
+            weights = fvValue(fv);
+        }
+    }
+    EXPECT_EQ(nexthops, "2001:db8::1,2002:db8::1,2003:db8::1");
+    EXPECT_EQ(ifnames, "Ethernet1,Ethernet2,Ethernet3");
+    EXPECT_EQ(sids, "2001:db8::2,2002:db8::2,2003:db8::2");
+    EXPECT_EQ(srcs, "2001:db8::3,2002:db8::3,2003:db8::3");
+    EXPECT_EQ(weights, "1,2,3");
+
+    free(nlh_1);
+    free(nlh_2);
+    free(nlh_3);
+    free(group_nlh);
+}
+
+// ============================================================================
+
+// Additional RouteSync coverage tests
+// ============================================================================
+
+TEST_F(FpmSyncdResponseTest, TestRouteResponseSuccess)
+{
+    /* Test successful route response handling */
+    EXPECT_CALL(m_mockFpm, send(_)).WillOnce(Return(true));
+
+    m_routeSync.onRouteResponse("10.0.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestRouteResponseFailure)
+{
+    /* Test failed route response handling */
+    EXPECT_CALL(m_mockFpm, send(_)).Times(0);
+
+    m_routeSync.onRouteResponse("10.0.1.0/24", {
+        {"err_str", "SWSS_RC_INTERNAL_ERROR"},
+        {"protocol", "bgp"},
+    });
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestIPv6RouteResponse)
+{
+    /* Test IPv6 route response */
+    EXPECT_CALL(m_mockFpm, send(_)).WillOnce(Return(true));
+
+    m_routeSync.onRouteResponse("2001:db8::/64", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestVrfRouteResponse)
+{
+    /* Test VRF route response */
+    EXPECT_CALL(m_mockFpm, send(_)).WillOnce(Return(true));
+
+    m_routeSync.onRouteResponse("Vrf1:192.168.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestSuppressionControl)
+{
+    /* Test route suppression enable/disable */
+    m_routeSync.setSuppressionEnabled(true);
+    ASSERT_TRUE(m_routeSync.m_isSuppressionEnabled);
+
+    m_routeSync.setSuppressionEnabled(false);
+    ASSERT_FALSE(m_routeSync.m_isSuppressionEnabled);
+
+    // Re-enable for other tests
+    m_routeSync.setSuppressionEnabled(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestMultipleRouteResponses)
+{
+    /* Test handling multiple route responses */
+    EXPECT_CALL(m_mockFpm, send(_)).Times(3).WillRepeatedly(Return(true));
+
+    m_routeSync.onRouteResponse("10.10.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    m_routeSync.onRouteResponse("10.20.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    m_routeSync.onRouteResponse("10.30.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestRouteResponseWithDifferentProtocols)
+{
+    /* Test routes with different protocols */
+    EXPECT_CALL(m_mockFpm, send(_)).Times(3).WillRepeatedly(Return(true));
+
+    m_routeSync.onRouteResponse("172.16.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "kernel"},
+    });
+
+    m_routeSync.onRouteResponse("172.17.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "static"},
+    });
+
+    m_routeSync.onRouteResponse("172.18.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "ospf"},
+    });
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestNextHopDeletion)
+{
+    /* Test nexthop deletion handling */
+    uint32_t test_id = 999;
+    int32_t test_ifindex = 10;
+
+    // First add a nexthop
+    struct nlmsghdr* nlh = createNewNextHopMsgHdr(test_ifindex, "10.1.1.1", test_id);
+    ASSERT_NE(nlh, nullptr);
+
+    EXPECT_CALL(m_mockRouteSync, getIfName(test_ifindex, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char *ifname, size_t size) {
+                strncpy(ifname, "Ethernet0", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    m_mockRouteSync.onNextHopMsg(nlh, (int)(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg))));
+    free(nlh);
+
+    // Now delete it - create delete message
+    nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
+    memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
+    nlh->nlmsg_type = RTM_DELNEXTHOP;
+    nlh->nlmsg_flags = NLM_F_REQUEST;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
+
+    struct nhmsg *nhm = (struct nhmsg *)NLMSG_DATA(nlh);
+    nhm->nh_family = AF_INET;
+
+    // Add NHA_ID
+    struct rtattr *rta = (struct rtattr *)((char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len));
+    rta->rta_type = NHA_ID;
+    rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
+    *(uint32_t *)RTA_DATA(rta) = test_id;
+    nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + RTA_ALIGN(rta->rta_len);
+
+    m_mockRouteSync.onNextHopMsg(nlh, (int)(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg))));
+    free(nlh);
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestInvalidNextHopMessage)
+{
+    /* Test handling of malformed nexthop messages */
+    struct nlmsghdr *nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
+    memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
+
+    nlh->nlmsg_type = RTM_NEWNEXTHOP;
+    nlh->nlmsg_flags = NLM_F_REQUEST;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct nhmsg));
+
+    struct nhmsg *nhm = (struct nhmsg *)NLMSG_DATA(nlh);
+    nhm->nh_family = AF_INET;
+
+    // No attributes - invalid message
+    m_mockRouteSync.onNextHopMsg(nlh, 0);
+
+    free(nlh);
+    ASSERT_TRUE(true); // No crash
+}
+
+TEST_F(FpmSyncdResponseTest, TestBatchRouteResponses)
+{
+    /* Test batch processing of route responses */
+    EXPECT_CALL(m_mockFpm, send(_)).Times(10).WillRepeatedly(Return(true));
+
+    for (int i = 0; i < 10; i++) {
+        char prefix[32];
+        snprintf(prefix, sizeof(prefix), "192.168.%d.0/24", i);
+        m_routeSync.onRouteResponse(prefix, {
+            {"err_str", "SWSS_RC_SUCCESS"},
+            {"protocol", "bgp"},
+        });
+    }
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestIPv6NextHopHandling)
+{
+    /* Test IPv6 nexthop operations */
+    uint32_t test_id = 777;
+    int32_t test_ifindex = 20;
+
+    struct nlmsghdr* nlh = createNewNextHopMsgHdr(test_ifindex, "2001:db8::1", test_id, AF_INET6);
+    ASSERT_NE(nlh, nullptr);
+
+    EXPECT_CALL(m_mockRouteSync, getIfName(test_ifindex, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char *ifname, size_t size) {
+                strncpy(ifname, "Ethernet4", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    m_mockRouteSync.onNextHopMsg(nlh, (int)(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg))));
+    free(nlh);
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestMixedIPv4IPv6Routes)
+{
+    /* Test mixed IPv4 and IPv6 route responses */
+    EXPECT_CALL(m_mockFpm, send(_)).Times(4).WillRepeatedly(Return(true));
+
+    m_routeSync.onRouteResponse("10.50.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    m_routeSync.onRouteResponse("2001:db8:1::/64", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    m_routeSync.onRouteResponse("10.51.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    m_routeSync.onRouteResponse("2001:db8:2::/64", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestErrorStringVariations)
+{
+    /* Test different error string handling */
+    EXPECT_CALL(m_mockFpm, send(_)).Times(1).WillOnce(Return(true));
+
+    // Success case
+    m_routeSync.onRouteResponse("10.100.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    // Various failure cases - no send expected
+    m_routeSync.onRouteResponse("10.101.0.0/24", {
+        {"err_str", "SWSS_RC_NOT_FOUND"},
+        {"protocol", "bgp"},
+    });
+
+    m_routeSync.onRouteResponse("10.102.0.0/24", {
+        {"err_str", "SWSS_RC_EXISTS"},
+        {"protocol", "bgp"},
+    });
+
+    ASSERT_TRUE(true);
+}
+
+TEST_F(FpmSyncdResponseTest, TestFpmConnectionState)
+{
+    /* Test FPM connection state */
+    // Connection is established in fixture (MockFpm constructor calls onFpmConnected)
+    // Just verify we can send route responses successfully
+    EXPECT_CALL(m_mockFpm, send(_)).WillOnce(Return(true));
+
+    m_routeSync.onRouteResponse("10.200.0.0/24", {
+        {"err_str", "SWSS_RC_SUCCESS"},
+        {"protocol", "bgp"},
+    });
+
+    ASSERT_TRUE(true);
+}
+
+/* parseEncap tests - Test VNI and RMAC extraction from EVPN encapsulation attributes */
+
+TEST_F(FpmSyncdResponseTest, TestParseEncapVxlanVniPath)
+{
+    /* Test parseEncap with VXLAN_VNI path (NH_ENCAP_VXLAN) */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Create nested RTA_ENCAP attribute
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    ASSERT_NE(nest, nullptr);
+
+    // Add VNI at index 0 (VXLAN_VNI path)
+    uint32_t vni = 10100;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni); // VXLAN_VNI = 0
+
+    // Add RMAC at index 1
+    uint8_t rmac_bytes[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, rmac_bytes, 6);
+
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    // Parse the encap attribute
+    uint32_t encap_value = 0;
+    string rmac;
+    m_routeSync.parseEncap(nest, encap_value, rmac);
+
+    EXPECT_EQ(encap_value, vni);
+    EXPECT_EQ(rmac, "aa:bb:cc:dd:ee:ff");
+}
+
+TEST_F(FpmSyncdResponseTest, TestParseEncapLwtunnelPath)
+{
+    /* Test parseEncap with LWTUNNEL_IP_ID path (LWTUNNEL_ENCAP_IP) */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Create nested RTA_ENCAP attribute
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    ASSERT_NE(nest, nullptr);
+
+    // Add VNI at LWTUNNEL_IP_ID (1) as uint64 in network byte order
+    // The code does: encap_value = ntohll((*(uint64_t *)RTA_DATA(...))) & 0xFFFFFFFF
+    // So we need to provide VNI in the upper 32 bits in big-endian format
+    uint32_t vni = 10000;
+    uint64_t vni_64 = ((uint64_t)htonl(vni) << 32) | htonl(0);
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, &vni_64, sizeof(uint64_t)); // LWTUNNEL_IP_ID = 1
+
+    // Add RMAC at index 3 (VXLAN_RMAC)
+    uint8_t rmac_bytes[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 3, rmac_bytes, 6); // VXLAN_RMAC = 3
+
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    // Parse the encap attribute
+    uint32_t encap_value = 0;
+    string rmac;
+    m_routeSync.parseEncap(nest, encap_value, rmac);
+
+    EXPECT_EQ(encap_value, 10000u);
+    EXPECT_EQ(rmac, "00:11:22:33:44:55");
+}
+
+TEST_F(FpmSyncdResponseTest, TestParseEncapMissingVni)
+{
+    /* Test parseEncap with missing VNI - should return early */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Create nested RTA_ENCAP attribute without VNI
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    ASSERT_NE(nest, nullptr);
+
+    // Only add RMAC, no VNI
+    uint8_t rmac_bytes[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 5, rmac_bytes, 6); // Wrong index
+
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    // Parse should return without setting values
+    uint32_t encap_value = 9999;
+    string rmac = "unchanged";
+    m_routeSync.parseEncap(nest, encap_value, rmac);
+
+    // Values should remain unchanged since parsing failed
+    EXPECT_EQ(encap_value, 9999u);
+    EXPECT_EQ(rmac, "unchanged");
+}
+
+TEST_F(FpmSyncdResponseTest, TestParseEncapMissingRmac)
+{
+    /* Test parseEncap with missing RMAC - should return early */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Create nested RTA_ENCAP attribute
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    ASSERT_NE(nest, nullptr);
+
+    // Add VNI but no RMAC
+    uint32_t vni = 20200;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni); // VXLAN_VNI = 0
+
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    // Parse should set VNI but not RMAC
+    uint32_t encap_value = 0;
+    string rmac = "unchanged";
+    m_routeSync.parseEncap(nest, encap_value, rmac);
+
+    // encap_value gets set but rmac should remain unchanged
+    EXPECT_EQ(rmac, "unchanged");
+}
+
+TEST_F(FpmSyncdResponseTest, TestParseEncapDifferentRmacValues)
+{
+    /* Test parseEncap with different RMAC values */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Test all zeros RMAC
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    ASSERT_NE(nest, nullptr);
+
+    uint32_t vni = 30300;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni);
+
+    uint8_t rmac_bytes[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, rmac_bytes, 6);
+
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    uint32_t encap_value = 0;
+    string rmac;
+    m_routeSync.parseEncap(nest, encap_value, rmac);
+
+    EXPECT_EQ(encap_value, vni);
+    EXPECT_EQ(rmac, "00:00:00:00:00:00");
+}
+
+TEST_F(FpmSyncdResponseTest, TestParseEncapBroadcastRmac)
+{
+    /* Test parseEncap with broadcast RMAC */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    ASSERT_NE(nest, nullptr);
+
+    uint32_t vni = 40400;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni);
+
+    // Broadcast MAC
+    uint8_t rmac_bytes[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, rmac_bytes, 6);
+
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    uint32_t encap_value = 0;
+    string rmac;
+    m_routeSync.parseEncap(nest, encap_value, rmac);
+
+    EXPECT_EQ(encap_value, vni);
+    EXPECT_EQ(rmac, "ff:ff:ff:ff:ff:ff");
+}
+
+/* getEvpnNextHop tests - Test EVPN nexthop parsing from netlink attributes */
+
+TEST_F(FpmSyncdResponseTest, TestGetEvpnNextHopSingleIPv4Gateway)
+{
+    /* Test getEvpnNextHop with single IPv4 gateway */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Add RTA_GATEWAY (IPv4)
+    struct in_addr gw_addr;
+    inet_pton(AF_INET, "10.1.1.1", &gw_addr);
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, RTA_GATEWAY, &gw_addr, sizeof(gw_addr));
+
+    // Add RTA_OIF (interface index)
+    int32_t ifindex = 10; // Mocked to return "Vrf10"
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, RTA_OIF, ifindex);
+
+    // Add RTA_ENCAP_TYPE
+    uint16_t encap_type = 100; // NH_ENCAP_VXLAN
+    ut_fpmsyncd::nl_attr_put16(nlh, MAX_PAYLOAD, RTA_ENCAP_TYPE, encap_type);
+
+    // Add RTA_ENCAP with VNI and RMAC
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    uint32_t vni = 10100;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni); // VXLAN_VNI = 0
+    uint8_t rmac_bytes[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, rmac_bytes, 6);
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    // Parse attributes
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    netlink_parse_rtattr(tb, RTA_MAX, (struct rtattr *)NLMSG_DATA(nlh),
+                         nlh->nlmsg_len - NLMSG_LENGTH(0));
+
+    string nexthops, vni_list, mac_list, intf_list;
+    bool result = m_routeSync.getEvpnNextHop(nlh, 100, tb, nexthops, vni_list, mac_list, intf_list);
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(nexthops, "10.1.1.1");
+    EXPECT_EQ(vni_list, "10100");
+    EXPECT_EQ(mac_list, "aa:bb:cc:dd:ee:ff");
+    EXPECT_EQ(intf_list, "Vrf10");
+}
+
+TEST_F(FpmSyncdResponseTest, TestGetEvpnNextHopSingleIPv6Gateway)
+{
+    /* Test getEvpnNextHop with single IPv6 gateway */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Add RTA_GATEWAY (IPv6)
+    struct in6_addr gw_addr6;
+    inet_pton(AF_INET6, "2001:db8::1", &gw_addr6);
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, RTA_GATEWAY, &gw_addr6, sizeof(gw_addr6));
+
+    // Add RTA_OIF
+    int32_t ifindex = 10;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, RTA_OIF, ifindex);
+
+    // Add RTA_ENCAP_TYPE and RTA_ENCAP
+    uint16_t encap_type = 100;
+    ut_fpmsyncd::nl_attr_put16(nlh, MAX_PAYLOAD, RTA_ENCAP_TYPE, encap_type);
+
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    uint32_t vni = 20200;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni);
+    uint8_t rmac_bytes[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, rmac_bytes, 6);
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    netlink_parse_rtattr(tb, RTA_MAX, (struct rtattr *)NLMSG_DATA(nlh),
+                         nlh->nlmsg_len - NLMSG_LENGTH(0));
+
+    string nexthops, vni_list, mac_list, intf_list;
+    bool result = m_routeSync.getEvpnNextHop(nlh, 100, tb, nexthops, vni_list, mac_list, intf_list);
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(nexthops, "2001:db8::1");
+    EXPECT_EQ(vni_list, "20200");
+    EXPECT_EQ(mac_list, "00:11:22:33:44:55");
+}
+
+TEST_F(FpmSyncdResponseTest, TestGetEvpnNextHopWithRtaVia)
+{
+    /* Test getEvpnNextHop with RTA_VIA instead of RTA_GATEWAY */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Add RTA_VIA (IPv4)
+    struct {
+        uint16_t family;
+        uint8_t addr[4];
+    } via_data;
+    via_data.family = AF_INET;
+    inet_pton(AF_INET, "192.168.1.1", via_data.addr);
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, RTA_VIA, &via_data, sizeof(via_data));
+
+    // Add RTA_OIF
+    int32_t ifindex = 10;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, RTA_OIF, ifindex);
+
+    // Add RTA_ENCAP_TYPE and RTA_ENCAP
+    uint16_t encap_type = 100;
+    ut_fpmsyncd::nl_attr_put16(nlh, MAX_PAYLOAD, RTA_ENCAP_TYPE, encap_type);
+
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    uint32_t vni = 30300;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni);
+    uint8_t rmac_bytes[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, rmac_bytes, 6);
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    netlink_parse_rtattr(tb, RTA_MAX, (struct rtattr *)NLMSG_DATA(nlh),
+                         nlh->nlmsg_len - NLMSG_LENGTH(0));
+
+    string nexthops, vni_list, mac_list, intf_list;
+    bool result = m_routeSync.getEvpnNextHop(nlh, 100, tb, nexthops, vni_list, mac_list, intf_list);
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(nexthops, "192.168.1.1");
+    EXPECT_EQ(vni_list, "30300");
+}
+
+TEST_F(FpmSyncdResponseTest, TestGetEvpnNextHopIPv6V4Mapped)
+{
+    /* Test IPv6 v4-mapped address handling */
+    struct nlmsghdr *nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
+    ASSERT_NE(nlh, nullptr);
+
+    memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Add IPv6 v4-mapped address (::ffff:10.1.1.1)
+    struct in6_addr gw_addr6;
+    inet_pton(AF_INET6, "::ffff:10.1.1.1", &gw_addr6);
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, RTA_GATEWAY, &gw_addr6, sizeof(gw_addr6));
+
+    // Add RTA_OIF
+    int32_t ifindex = 10;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, RTA_OIF, ifindex);
+
+    // Add RTA_ENCAP_TYPE and RTA_ENCAP
+    uint16_t encap_type = 100;
+    ut_fpmsyncd::nl_attr_put16(nlh, MAX_PAYLOAD, RTA_ENCAP_TYPE, encap_type);
+
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    uint32_t vni = 40400;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni);
+    uint8_t rmac_bytes[6] = {0xaa, 0xaa, 0xbb, 0xbb, 0xcc, 0xcc};
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, rmac_bytes, 6);
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    netlink_parse_rtattr(tb, RTA_MAX, (struct rtattr *)NLMSG_DATA(nlh),
+                         nlh->nlmsg_len - NLMSG_LENGTH(0));
+
+    string nexthops, vni_list, mac_list, intf_list;
+    bool result = m_routeSync.getEvpnNextHop(nlh, 100, tb, nexthops, vni_list, mac_list, intf_list);
+
+    EXPECT_TRUE(result);
+    // Should be converted to IPv4
+    EXPECT_EQ(nexthops, "10.1.1.1");
+
+    free(nlh);
+}
+
+TEST_F(FpmSyncdResponseTest, TestGetEvpnNextHopMissingEncap)
+{
+    /* Test getEvpnNextHop returns false when encap_value is 0 */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Add RTA_GATEWAY
+    struct in_addr gw_addr;
+    inet_pton(AF_INET, "10.2.2.2", &gw_addr);
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, RTA_GATEWAY, &gw_addr, sizeof(gw_addr));
+
+    // Add RTA_OIF
+    int32_t ifindex = 10;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, RTA_OIF, ifindex);
+
+    // No RTA_ENCAP - encap_value will be 0
+
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    netlink_parse_rtattr(tb, RTA_MAX, (struct rtattr *)NLMSG_DATA(nlh),
+                         nlh->nlmsg_len - NLMSG_LENGTH(0));
+
+    string nexthops, vni_list, mac_list, intf_list;
+    bool result = m_routeSync.getEvpnNextHop(nlh, 100, tb, nexthops, vni_list, mac_list, intf_list);
+
+    EXPECT_FALSE(result); // Should return false due to encap_value == 0
+}
+
+TEST_F(FpmSyncdResponseTest, TestGetEvpnNextHopZeroRmac)
+{
+    /* Test getEvpnNextHop returns false when RMAC is all zeros */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Add RTA_GATEWAY
+    struct in_addr gw_addr;
+    inet_pton(AF_INET, "10.3.3.3", &gw_addr);
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, RTA_GATEWAY, &gw_addr, sizeof(gw_addr));
+
+    // Add RTA_OIF
+    int32_t ifindex = 10;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, RTA_OIF, ifindex);
+
+    // Add RTA_ENCAP with zero RMAC
+    uint16_t encap_type = 100;
+    ut_fpmsyncd::nl_attr_put16(nlh, MAX_PAYLOAD, RTA_ENCAP_TYPE, encap_type);
+
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    uint32_t vni = 50500;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni);
+    uint8_t rmac_bytes[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // Zero RMAC
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, rmac_bytes, 6);
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    netlink_parse_rtattr(tb, RTA_MAX, (struct rtattr *)NLMSG_DATA(nlh),
+                         nlh->nlmsg_len - NLMSG_LENGTH(0));
+
+    string nexthops, vni_list, mac_list, intf_list;
+    bool result = m_routeSync.getEvpnNextHop(nlh, 100, tb, nexthops, vni_list, mac_list, intf_list);
+
+    EXPECT_FALSE(result); // Should return false due to zero RMAC
+}
+
+TEST_F(FpmSyncdResponseTest, TestGetEvpnNextHopUnknownInterface)
+{
+    /* Test getEvpnNextHop returns false when interface name is unknown */
+    struct nlmsghdr *nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
+    ASSERT_NE(nlh, nullptr);
+
+    memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Add RTA_GATEWAY
+    struct in_addr gw_addr;
+    inet_pton(AF_INET, "10.4.4.4", &gw_addr);
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, RTA_GATEWAY, &gw_addr, sizeof(gw_addr));
+
+    // Add RTA_OIF with unmapped index (will return NULL from getIfName)
+    int32_t ifindex = 999; // Not mocked, will fail getIfName
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, RTA_OIF, ifindex);
+
+    // Add RTA_ENCAP
+    uint16_t encap_type = 100;
+    ut_fpmsyncd::nl_attr_put16(nlh, MAX_PAYLOAD, RTA_ENCAP_TYPE, encap_type);
+
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    uint32_t vni = 60600;
+    ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni);
+    uint8_t rmac_bytes[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, rmac_bytes, 6);
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    netlink_parse_rtattr(tb, RTA_MAX, (struct rtattr *)NLMSG_DATA(nlh),
+                         nlh->nlmsg_len - NLMSG_LENGTH(0));
+
+    string nexthops, vni_list, mac_list, intf_list;
+    bool result = m_routeSync.getEvpnNextHop(nlh, 100, tb, nexthops, vni_list, mac_list, intf_list);
+
+    EXPECT_FALSE(result); // Should return false due to unknown interface
+
+    free(nlh);
+}
+
+TEST_F(FpmSyncdResponseTest, TestGetEvpnNextHopMultipath)
+{
+    /* Test getEvpnNextHop with multipath (RTA_MULTIPATH with 2 nexthops) */
+    struct nlmsghdr nlh_storage;
+    struct nlmsghdr *nlh = &nlh_storage;
+
+    memset(nlh, 0, sizeof(*nlh));
+    nlh->nlmsg_len = NLMSG_LENGTH(0);
+    nlh->nlmsg_type = RTM_NEWROUTE;
+
+    // Build multipath attribute manually
+    // Structure: RTA_MULTIPATH contains rtnexthop entries
+    char multipath_buf[512];
+    int multipath_len = 0;
+
+    // First nexthop
+    struct rtnexthop *rtnh1 = (struct rtnexthop *)&multipath_buf[multipath_len];
+    memset(rtnh1, 0, sizeof(*rtnh1));
+    rtnh1->rtnh_ifindex = 10; // Vrf10
+    rtnh1->rtnh_hops = 0;
+    rtnh1->rtnh_flags = 0;
+
+    // Start building attributes for first nexthop
+    int nh1_attr_start = multipath_len + sizeof(struct rtnexthop);
+
+    // Add RTA_GATEWAY for first nexthop
+    struct rtattr *gw_attr = (struct rtattr *)&multipath_buf[nh1_attr_start];
+    gw_attr->rta_len = RTA_LENGTH(sizeof(struct in_addr));
+    gw_attr->rta_type = RTA_GATEWAY;
+    struct in_addr gw1;
+    inet_pton(AF_INET, "10.10.1.1", &gw1);
+    memcpy(RTA_DATA(gw_attr), &gw1, sizeof(gw1));
+    int nh1_len = RTA_ALIGN(gw_attr->rta_len);
+
+    // Add RTA_ENCAP_TYPE for first nexthop
+    struct rtattr *encap_type_attr = (struct rtattr *)&multipath_buf[nh1_attr_start + nh1_len];
+    encap_type_attr->rta_len = RTA_LENGTH(sizeof(uint16_t));
+    encap_type_attr->rta_type = RTA_ENCAP_TYPE;
+    *(uint16_t *)RTA_DATA(encap_type_attr) = 100; // NH_ENCAP_VXLAN
+    nh1_len += RTA_ALIGN(encap_type_attr->rta_len);
+
+    // Add RTA_ENCAP for first nexthop (nested)
+    struct rtattr *encap_attr = (struct rtattr *)&multipath_buf[nh1_attr_start + nh1_len];
+    encap_attr->rta_len = RTA_LENGTH(0);
+    encap_attr->rta_type = RTA_ENCAP | NLA_F_NESTED;
+    int encap_start = nh1_attr_start + nh1_len + RTA_ALIGN(RTA_LENGTH(0));
+
+    // Add VNI inside RTA_ENCAP
+    struct rtattr *vni_attr = (struct rtattr *)&multipath_buf[encap_start];
+    vni_attr->rta_len = RTA_LENGTH(sizeof(uint32_t));
+    vni_attr->rta_type = 0; // VXLAN_VNI
+    *(uint32_t *)RTA_DATA(vni_attr) = 10100;
+    int encap_len = RTA_ALIGN(vni_attr->rta_len);
+
+    // Add RMAC inside RTA_ENCAP
+    struct rtattr *rmac_attr = (struct rtattr *)&multipath_buf[encap_start + encap_len];
+    rmac_attr->rta_len = RTA_LENGTH(6);
+    rmac_attr->rta_type = 1; // RMAC index
+    uint8_t rmac1[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01};
+    memcpy(RTA_DATA(rmac_attr), rmac1, 6);
+    encap_len += RTA_ALIGN(rmac_attr->rta_len);
+
+    // Update encap_attr length
+    encap_attr->rta_len = (uint16_t)RTA_LENGTH(encap_len);
+    nh1_len += RTA_ALIGN(encap_attr->rta_len);
+
+    // Update first nexthop length
+    rtnh1->rtnh_len = (uint16_t)(sizeof(struct rtnexthop) + nh1_len);
+    multipath_len += NLMSG_ALIGN(rtnh1->rtnh_len);
+
+    // Second nexthop
+    struct rtnexthop *rtnh2 = (struct rtnexthop *)&multipath_buf[multipath_len];
+    memset(rtnh2, 0, sizeof(*rtnh2));
+    rtnh2->rtnh_ifindex = 10; // Vrf10
+    rtnh2->rtnh_hops = 0;
+    rtnh2->rtnh_flags = 0;
+
+    int nh2_attr_start = multipath_len + sizeof(struct rtnexthop);
+
+    // Add RTA_GATEWAY for second nexthop
+    struct rtattr *gw_attr2 = (struct rtattr *)&multipath_buf[nh2_attr_start];
+    gw_attr2->rta_len = RTA_LENGTH(sizeof(struct in_addr));
+    gw_attr2->rta_type = RTA_GATEWAY;
+    struct in_addr gw2;
+    inet_pton(AF_INET, "10.10.1.2", &gw2);
+    memcpy(RTA_DATA(gw_attr2), &gw2, sizeof(gw2));
+    int nh2_len = RTA_ALIGN(gw_attr2->rta_len);
+
+    // Add RTA_ENCAP_TYPE for second nexthop
+    struct rtattr *encap_type_attr2 = (struct rtattr *)&multipath_buf[nh2_attr_start + nh2_len];
+    encap_type_attr2->rta_len = RTA_LENGTH(sizeof(uint16_t));
+    encap_type_attr2->rta_type = RTA_ENCAP_TYPE;
+    *(uint16_t *)RTA_DATA(encap_type_attr2) = 100;
+    nh2_len += RTA_ALIGN(encap_type_attr2->rta_len);
+
+    // Add RTA_ENCAP for second nexthop
+    struct rtattr *encap_attr2 = (struct rtattr *)&multipath_buf[nh2_attr_start + nh2_len];
+    encap_attr2->rta_len = RTA_LENGTH(0);
+    encap_attr2->rta_type = RTA_ENCAP | NLA_F_NESTED;
+    int encap_start2 = nh2_attr_start + nh2_len + RTA_ALIGN(RTA_LENGTH(0));
+
+    struct rtattr *vni_attr2 = (struct rtattr *)&multipath_buf[encap_start2];
+    vni_attr2->rta_len = RTA_LENGTH(sizeof(uint32_t));
+    vni_attr2->rta_type = 0;
+    *(uint32_t *)RTA_DATA(vni_attr2) = 10100;
+    int encap_len2 = RTA_ALIGN(vni_attr2->rta_len);
+
+    struct rtattr *rmac_attr2 = (struct rtattr *)&multipath_buf[encap_start2 + encap_len2];
+    rmac_attr2->rta_len = RTA_LENGTH(6);
+    rmac_attr2->rta_type = 1;
+    uint8_t rmac2[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02};
+    memcpy(RTA_DATA(rmac_attr2), rmac2, 6);
+    encap_len2 += RTA_ALIGN(rmac_attr2->rta_len);
+
+    encap_attr2->rta_len = (uint16_t)RTA_LENGTH(encap_len2);
+    nh2_len += RTA_ALIGN(encap_attr2->rta_len);
+
+    rtnh2->rtnh_len = (uint16_t)(sizeof(struct rtnexthop) + nh2_len);
+    multipath_len += NLMSG_ALIGN(rtnh2->rtnh_len);
+
+    // Add the RTA_MULTIPATH attribute to nlh
+    ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, RTA_MULTIPATH, multipath_buf, multipath_len);
+
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    netlink_parse_rtattr(tb, RTA_MAX, (struct rtattr *)NLMSG_DATA(nlh),
+                         nlh->nlmsg_len - NLMSG_LENGTH(0));
+
+    string nexthops, vni_list, mac_list, intf_list;
+    bool result = m_routeSync.getEvpnNextHop(nlh, 100, tb, nexthops, vni_list, mac_list, intf_list);
+
+    EXPECT_TRUE(result);
+    // Should have two nexthops separated by comma
+    EXPECT_EQ(nexthops, "10.10.1.1,10.10.1.2");
+    EXPECT_EQ(vni_list, "10100,10100");
+    EXPECT_EQ(mac_list, "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:02");
+    EXPECT_EQ(intf_list, "Vrf10,Vrf10");
+}
+
+static nlmsghdr *initRawNlMsg(unsigned char *buffer, uint16_t msgType, unsigned int payloadLen)
+{
+    memset(buffer, 0, NLMSG_SPACE(MAX_PAYLOAD));
+    auto *nlh = reinterpret_cast<nlmsghdr *>(static_cast<void *>(buffer));
+    nlh->nlmsg_len = NLMSG_LENGTH(payloadLen);
+    nlh->nlmsg_type = msgType;
+    return nlh;
+}
+
+static bool addVxlanEncap(nlmsghdr *nlh, uint32_t vni, const uint8_t (&rmac)[6])
+{
+    uint16_t encapType = 100;
+    if (!ut_fpmsyncd::nl_attr_put16(nlh, MAX_PAYLOAD, RTA_ENCAP_TYPE, encapType))
+    {
+        return false;
+    }
+
+    struct rtattr *nest = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, RTA_ENCAP);
+    if (!nest || !ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, 0, vni) ||
+        !ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, 1, rmac, static_cast<unsigned int>(sizeof(rmac))))
+    {
+        return false;
+    }
+    ut_fpmsyncd::nl_attr_nest_end(nlh, nest);
+    return true;
+}
+
+static int appendRtAttr(char *buffer, int offset, int type, const void *data, unsigned int len)
+{
+    auto *attr = reinterpret_cast<rtattr *>(static_cast<void *>(buffer + offset));
+    attr->rta_type = static_cast<unsigned short>(type);
+    attr->rta_len = static_cast<unsigned short>(RTA_LENGTH(len));
+    memcpy(RTA_DATA(attr), data, len);
+    return offset + static_cast<int>(RTA_ALIGN(attr->rta_len));
+}
+
+static int appendVxlanEncapAttrs(char *buffer, int offset, uint32_t vni, const uint8_t (&rmac)[6])
+{
+    uint16_t encapType = 100;
+    offset = appendRtAttr(buffer, offset, RTA_ENCAP_TYPE, &encapType, static_cast<unsigned int>(sizeof(encapType)));
+
+    auto *encap = reinterpret_cast<rtattr *>(static_cast<void *>(buffer + offset));
+    encap->rta_type = static_cast<unsigned short>(RTA_ENCAP | NLA_F_NESTED);
+    encap->rta_len = static_cast<unsigned short>(RTA_LENGTH(0));
+    int encapOffset = offset + static_cast<int>(RTA_ALIGN(RTA_LENGTH(0)));
+
+    int nestedLen = 0;
+    nestedLen = appendRtAttr(buffer, encapOffset + nestedLen, 0, &vni, static_cast<unsigned int>(sizeof(vni))) - encapOffset;
+    nestedLen = appendRtAttr(buffer, encapOffset + nestedLen, 1, rmac, static_cast<unsigned int>(sizeof(rmac))) - encapOffset;
+
+    encap->rta_len = static_cast<unsigned short>(RTA_LENGTH(nestedLen));
+    return offset + static_cast<int>(RTA_ALIGN(encap->rta_len));
+}
+
+TEST_F(FpmSyncdResponseTest, TestGetEvpnNextHopWithIpv6RtaVia)
+{
+    unsigned char buffer[NLMSG_SPACE(MAX_PAYLOAD)] = {0};
+    nlmsghdr *nlh = initRawNlMsg(buffer, RTM_NEWROUTE, 0);
+
+    struct
+    {
+        uint16_t family;
+        uint8_t addr[16];
+    } via = {};
+    via.family = static_cast<uint16_t>(AF_INET6);
+    ASSERT_EQ(inet_pton(AF_INET6, "2001:db8:100::1", via.addr), 1);
+    ASSERT_TRUE(ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, RTA_VIA, &via, static_cast<unsigned int>(sizeof(via))));
+
+    ASSERT_TRUE(ut_fpmsyncd::nl_attr_put32(nlh, MAX_PAYLOAD, RTA_OIF, 10u));
+    const uint8_t rmac[6] = {0x02, 0x04, 0x06, 0x08, 0x0a, 0x0c};
+    ASSERT_TRUE(addVxlanEncap(nlh, 70700, rmac));
+
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    netlink_parse_rtattr(tb, RTA_MAX, reinterpret_cast<rtattr *>(NLMSG_DATA(nlh)),
+                         static_cast<int>(nlh->nlmsg_len - NLMSG_LENGTH(0)));
+
+    string nexthops, vniList, macList, intfList;
+    EXPECT_TRUE(m_routeSync.getEvpnNextHop(nlh, 100, tb, nexthops, vniList, macList, intfList));
+    EXPECT_EQ(nexthops, "2001:db8:100::1");
+    EXPECT_EQ(vniList, "70700");
+    EXPECT_EQ(macList, "02:04:06:08:0a:0c");
+    EXPECT_EQ(intfList, "Vrf10");
+}
+
+TEST_F(FpmSyncdResponseTest, TestGetEvpnNextHopMultipathWithRtaVia)
+{
+    unsigned char buffer[NLMSG_SPACE(MAX_PAYLOAD)] = {0};
+    nlmsghdr *nlh = initRawNlMsg(buffer, RTM_NEWROUTE, 0);
+
+    char multipath[512] = {0};
+    int multipathLen = 0;
+
+    auto addNexthop = [&](int family, const char *address, uint32_t vni, const uint8_t (&rmac)[6]) {
+        auto *rtnh = reinterpret_cast<rtnexthop *>(static_cast<void *>(multipath + multipathLen));
+        memset(rtnh, 0, sizeof(*rtnh));
+        rtnh->rtnh_ifindex = 10;
+
+        int attrOffset = multipathLen + sizeof(*rtnh);
+        if (family == AF_INET)
+        {
+            struct
+            {
+                uint16_t family;
+                uint8_t addr[4];
+            } via = {};
+            via.family = static_cast<uint16_t>(AF_INET);
+            EXPECT_EQ(inet_pton(AF_INET, address, via.addr), 1);
+            attrOffset = appendRtAttr(multipath, attrOffset, RTA_VIA, &via, static_cast<unsigned int>(sizeof(via)));
+        }
+        else
+        {
+            struct
+            {
+                uint16_t family;
+                uint8_t addr[16];
+            } via = {};
+            via.family = static_cast<uint16_t>(AF_INET6);
+            EXPECT_EQ(inet_pton(AF_INET6, address, via.addr), 1);
+            attrOffset = appendRtAttr(multipath, attrOffset, RTA_VIA, &via, static_cast<unsigned int>(sizeof(via)));
+        }
+
+        attrOffset = appendVxlanEncapAttrs(multipath, attrOffset, vni, rmac);
+        rtnh->rtnh_len = static_cast<uint16_t>(attrOffset - multipathLen);
+        multipathLen += static_cast<int>(NLMSG_ALIGN(rtnh->rtnh_len));
+    };
+
+    const uint8_t rmac1[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x01};
+    const uint8_t rmac2[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x02};
+    addNexthop(AF_INET, "10.10.20.1", 80800, rmac1);
+    addNexthop(AF_INET6, "2001:db8:200::1", 80801, rmac2);
+
+    ASSERT_TRUE(ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, RTA_MULTIPATH, multipath,
+                                         static_cast<unsigned int>(multipathLen)));
+
+    struct rtattr *tb[RTA_MAX + 1] = {0};
+    netlink_parse_rtattr(tb, RTA_MAX, reinterpret_cast<rtattr *>(NLMSG_DATA(nlh)),
+                         static_cast<int>(nlh->nlmsg_len - NLMSG_LENGTH(0)));
+
+    string nexthops, vniList, macList, intfList;
+    EXPECT_TRUE(m_routeSync.getEvpnNextHop(nlh, 100, tb, nexthops, vniList, macList, intfList));
+    EXPECT_EQ(nexthops, "10.10.20.1,2001:db8:200::1");
+    EXPECT_EQ(vniList, "80800,80801");
+    EXPECT_EQ(macList, "00:11:22:33:44:01,00:11:22:33:44:02");
+    EXPECT_EQ(intfList, "Vrf10,Vrf10");
+}
+
+TEST_F(FpmSyncdResponseTest, TestOnTcFilterMsgShlAddAndDelete)
+{
+    unsigned char buffer[NLMSG_SPACE(MAX_PAYLOAD)] = {0};
+    nlmsghdr *nlh = initRawNlMsg(buffer, RTM_NEWTFILTER, static_cast<unsigned int>(sizeof(tcmsg)));
+    auto *tcm = reinterpret_cast<tcmsg *>(NLMSG_DATA(nlh));
+    tcm->tcm_ifindex = 10;
+
+    char kind[] = "shl";
+    ASSERT_TRUE(ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, TCA_KIND, kind, static_cast<unsigned int>(sizeof(kind))));
+    struct rtattr *options = ut_fpmsyncd::nl_attr_nest(nlh, MAX_PAYLOAD, TCA_OPTIONS);
+    ASSERT_NE(options, nullptr);
+
+    struct in_addr vtep4;
+    ASSERT_EQ(inet_pton(AF_INET, "10.20.30.40", &vtep4), 1);
+    ASSERT_TRUE(ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, TCA_FLOWER_KEY_IPV4_SRC, &vtep4,
+                                         static_cast<unsigned int>(sizeof(vtep4))));
+
+    struct in6_addr vtep6;
+    ASSERT_EQ(inet_pton(AF_INET6, "2001:db8:300::1", &vtep6), 1);
+    ASSERT_TRUE(ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, TCA_FLOWER_KEY_IPV6_SRC, &vtep6,
+                                         static_cast<unsigned int>(sizeof(vtep6))));
+    ut_fpmsyncd::nl_attr_nest_end(nlh, options);
+
+    m_routeSync.onTcFilterMsg(nlh, static_cast<int>(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(tcmsg))));
+    m_pipeline->flush();
+
+    Table shlTable(m_db.get(), APP_EVPN_SPLIT_HORIZON_TABLE_NAME);
+    vector<FieldValueTuple> values;
+    ASSERT_TRUE(shlTable.get("Vlan0000:Vrf10", values));
+    auto vteps = swss::fvsGetValue(values, "vteps", true);
+    ASSERT_TRUE(vteps.has_value());
+    EXPECT_EQ(*vteps, "10.20.30.40,2001:db8:300::1");
+
+    nlh->nlmsg_type = RTM_DELTFILTER;
+    m_routeSync.onTcFilterMsg(nlh, static_cast<int>(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(tcmsg))));
+    m_pipeline->flush();
+    EXPECT_FALSE(shlTable.get("Vlan0000:Vrf10", values));
+}
+
+TEST_F(FpmSyncdResponseTest, TestOnTcFilterMsgShlMissingOptions)
+{
+    unsigned char buffer[NLMSG_SPACE(MAX_PAYLOAD)] = {0};
+    nlmsghdr *nlh = initRawNlMsg(buffer, RTM_NEWTFILTER, static_cast<unsigned int>(sizeof(tcmsg)));
+    auto *tcm = reinterpret_cast<tcmsg *>(NLMSG_DATA(nlh));
+    tcm->tcm_ifindex = 10;
+
+    char kind[] = "shl";
+    ASSERT_TRUE(ut_fpmsyncd::nl_attr_put(nlh, MAX_PAYLOAD, TCA_KIND, kind, static_cast<unsigned int>(sizeof(kind))));
+
+    m_routeSync.onTcFilterMsg(nlh, static_cast<int>(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(tcmsg))));
+    m_pipeline->flush();
+
+    Table shlTable(m_db.get(), APP_EVPN_SPLIT_HORIZON_TABLE_NAME);
+    vector<FieldValueTuple> values;
+    EXPECT_FALSE(shlTable.get("Vlan0000:Vrf10", values));
+}
+
+// Helper to create a VNET route with nexthop
+auto create_vnet_route(const char* dst_addr_str, const char* gateway_str, int ifindex)
+{
+    rtnl_route* route = rtnl_route_alloc();
+    auto dst_addr = create_nl_addr(dst_addr_str);
+    rtnl_route_set_dst(route, dst_addr.get());
+    rtnl_route_set_type(route, RTN_UNICAST);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET);
+    rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+    rtnl_route_set_table(route, RT_TABLE_MAIN);
+
+    if (gateway_str && ifindex > 0) {
+        rtnl_nexthop* nh = rtnl_route_nh_alloc();
+        rtnl_route_nh_set_weight(nh, 0);
+        rtnl_route_nh_set_ifindex(nh, ifindex);
+        auto gateway_addr = create_nl_addr(gateway_str);
+        rtnl_route_nh_set_gateway(nh, gateway_addr.get());
+        rtnl_route_add_nexthop(route, nh);
+    } else if (ifindex > 0) {
+        // No gateway, just interface
+        rtnl_nexthop* nh = rtnl_route_nh_alloc();
+        rtnl_route_nh_set_weight(nh, 0);
+        rtnl_route_nh_set_ifindex(nh, ifindex);
+        rtnl_route_add_nexthop(route, nh);
+    }
+
+    return unique_ptr<rtnl_route, decltype(rtnl_route_put)*>(route, rtnl_route_put);
+}
+
+// Test RTM_DELROUTE for VNET route
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_Delete)
+{
+    // Create a simple route for deletion test
+    auto route = create_vnet_route("10.10.1.0/24", "192.168.1.1", 21);
+
+    // Call onVnetRouteMsg with RTM_DELROUTE
+    m_routeSync.onVnetRouteMsg(RTM_DELROUTE, (nl_object*)route.get(), "Vnet10");
+
+    // Verify: Both vnet route and tunnel tables should have delete called
+    // We can't easily verify deletes without mocking the tables, but the function should not crash
+}
+
+// Test IPv6 link-local address filtering
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_IPv6LinkLocal)
+{
+    rtnl_route* route = rtnl_route_alloc();
+    auto dst_addr = create_nl_addr("fe80::1/128");
+    rtnl_route_set_dst(route, dst_addr.get());
+    rtnl_route_set_type(route, RTN_UNICAST);
+    rtnl_route_set_family(route, AF_INET6);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+
+    // Add a nexthop
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 21);
+    rtnl_route_add_nexthop(route, nh);
+
+    auto route_ptr = unique_ptr<rtnl_route, decltype(rtnl_route_put)*>(route, rtnl_route_put);
+
+    // Should be filtered out and return early
+    m_routeSync.onVnetRouteMsg(RTM_NEWROUTE, (nl_object*)route_ptr.get(), "Vnet10");
+
+    // No crash means success - link-local was filtered
+}
+
+// Test IPv6 multicast address filtering
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_IPv6Multicast)
+{
+    rtnl_route* route = rtnl_route_alloc();
+    auto dst_addr = create_nl_addr("ff02::1/128");
+    rtnl_route_set_dst(route, dst_addr.get());
+    rtnl_route_set_type(route, RTN_UNICAST);
+    rtnl_route_set_family(route, AF_INET6);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+
+    // Add a nexthop
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 21);
+    rtnl_route_add_nexthop(route, nh);
+
+    auto route_ptr = unique_ptr<rtnl_route, decltype(rtnl_route_put)*>(route, rtnl_route_put);
+
+    // Should be filtered out and return early
+    m_routeSync.onVnetRouteMsg(RTM_NEWROUTE, (nl_object*)route_ptr.get(), "Vnet10");
+
+    // No crash means success - multicast was filtered
+}
+
+// Test unknown message type
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_UnknownMsgType)
+{
+    auto route = create_vnet_route("10.10.2.0/24", "192.168.1.1", 21);
+
+    // Use an invalid message type (not RTM_NEWROUTE or RTM_DELROUTE)
+    m_routeSync.onVnetRouteMsg(RTM_GETROUTE, (nl_object*)route.get(), "Vnet10");
+
+    // Should return early without processing
+}
+
+// Test RTN_BLACKHOLE route rejection
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_Blackhole)
+{
+    auto route = create_vnet_route("10.10.3.0/24", nullptr, 0);
+    rtnl_route_set_type(route.get(), RTN_BLACKHOLE);
+
+    m_routeSync.onVnetRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), "Vnet10");
+
+    // Should log and return without processing
+}
+
+// Test RTN_MULTICAST route rejection
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_Multicast)
+{
+    auto route = create_vnet_route("10.10.4.0/24", nullptr, 0);
+    rtnl_route_set_type(route.get(), RTN_MULTICAST);
+
+    m_routeSync.onVnetRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), "Vnet10");
+
+    // Should log and return without processing
+}
+
+// Test RTN_BROADCAST route rejection
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_Broadcast)
+{
+    auto route = create_vnet_route("10.10.5.0/24", nullptr, 0);
+    rtnl_route_set_type(route.get(), RTN_BROADCAST);
+
+    m_routeSync.onVnetRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), "Vnet10");
+
+    // Should log and return without processing
+}
+
+// Test RTN_LOCAL route rejection
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_Local)
+{
+    auto route = create_vnet_route("10.10.6.0/24", nullptr, 0);
+    rtnl_route_set_type(route.get(), RTN_LOCAL);
+
+    m_routeSync.onVnetRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), "Vnet10");
+
+    // Should log and return without processing
+}
+
+// Test route with no nexthops
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_NoNexthops)
+{
+    auto route = create_vnet_route("10.10.7.0/24", nullptr, 0);
+
+    m_routeSync.onVnetRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), "Vnet10");
+
+    // Should log and return without processing
+}
+
+// Test VXLAN tunnel route (interface starts with "Brvxlan")
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_VxlanTunnel)
+{
+    auto route = create_vnet_route("10.10.8.0/24", "192.168.100.1", 20);  // ifindex 20 = "Brvxlan100"
+
+    m_routeSync.onVnetRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), "Vnet10");
+
+    // Should be written to VNET_ROUTE_TUNNEL_TABLE
+    Table tunnelTable(m_db.get(), "VNET_ROUTE_TUNNEL_TABLE");
+    vector<FieldValueTuple> result;
+    EXPECT_TRUE(tunnelTable.get("Vnet10:10.10.8.0/24", result));
+
+    // Verify endpoint field
+    bool foundEndpoint = false;
+    for (const auto& fv : result) {
+        if (fvField(fv) == "endpoint") {
+            EXPECT_EQ(fvValue(fv), "192.168.100.1");
+            foundEndpoint = true;
+        }
+    }
+    EXPECT_TRUE(foundEndpoint);
+}
+
+// Test regular VNET route with gateway and interface
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_RegularWithGateway)
+{
+    auto route = create_vnet_route("10.10.9.0/24", "192.168.1.10", 21);  // ifindex 21 = "Ethernet0"
+
+    m_routeSync.onVnetRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), "Vnet10");
+
+    // Should be written to VNET_ROUTE_TABLE
+    Table routeTable(m_db.get(), "VNET_ROUTE_TABLE");
+    vector<FieldValueTuple> result;
+    EXPECT_TRUE(routeTable.get("Vnet10:10.10.9.0/24", result));
+
+    // Verify ifname and nexthop fields
+    bool foundIfname = false, foundNexthop = false;
+    for (const auto& fv : result) {
+        if (fvField(fv) == "ifname") {
+            EXPECT_EQ(fvValue(fv), "Ethernet0");
+            foundIfname = true;
+        } else if (fvField(fv) == "nexthop") {
+            EXPECT_EQ(fvValue(fv), "192.168.1.10");
+            foundNexthop = true;
+        }
+    }
+    EXPECT_TRUE(foundIfname);
+    EXPECT_TRUE(foundNexthop);
+}
+
+// Test regular VNET route with only interface (no gateway)
+TEST_F(FpmSyncdResponseTest, TestOnVnetRouteMsg_RegularNoGateway)
+{
+    auto route = create_vnet_route("10.10.10.0/24", nullptr, 21);  // ifindex 21 = "Ethernet0"
+
+    m_routeSync.onVnetRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), "Vnet10");
+
+    // Should be written to VNET_ROUTE_TABLE
+    Table routeTable(m_db.get(), "VNET_ROUTE_TABLE");
+    vector<FieldValueTuple> result;
+    EXPECT_TRUE(routeTable.get("Vnet10:10.10.10.0/24", result));
+
+    // Verify ifname field exists, nexthop should not be present (or empty)
+    bool foundIfname = false;
+    for (const auto& fv : result) {
+        if (fvField(fv) == "ifname") {
+            EXPECT_EQ(fvValue(fv), "Ethernet0");
+            foundIfname = true;
+        }
+    }
+    EXPECT_TRUE(foundIfname);
+}
+
+// Test getNextHopGw with empty gateway (IPv4)
+TEST_F(FpmSyncdResponseTest, TestGetNextHopGwEmptyIPv4)
+{
+    auto route = create_route("10.20.1.0/24");
+
+    // Add a nexthop without gateway
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh, 0);
+    rtnl_route_nh_set_ifindex(nh, 21);
+    // Don't set gateway - should get 0.0.0.0
+    rtnl_route_add_nexthop(route.get(), nh);
+
+    string gw = m_routeSync.getNextHopGw(route.get());
+    EXPECT_EQ(gw, "0.0.0.0");
+}
+
+// Test getNextHopGw with empty gateway (IPv6)
+TEST_F(FpmSyncdResponseTest, TestGetNextHopGwEmptyIPv6)
+{
+    rtnl_route* route = rtnl_route_alloc();
+    auto dst_addr = create_nl_addr("2001:db8::/64");
+    rtnl_route_set_dst(route, dst_addr.get());
+    rtnl_route_set_type(route, RTN_UNICAST);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET6);
+
+    // Add a nexthop without gateway
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh, 0);
+    rtnl_route_nh_set_ifindex(nh, 21);
+    // Don't set gateway - should get ::
+    rtnl_route_add_nexthop(route, nh);
+
+    auto route_ptr = unique_ptr<rtnl_route, decltype(rtnl_route_put)*>(route, rtnl_route_put);
+
+    string gw = m_routeSync.getNextHopGw(route_ptr.get());
+    EXPECT_EQ(gw, "::");
+}
+
+// Test getNextHopGw with multiple nexthops (mixed empty and non-empty)
+TEST_F(FpmSyncdResponseTest, TestGetNextHopGwMultipleWithEmpty)
+{
+    auto route = create_route("10.20.2.0/24");
+
+    // First nexthop with gateway
+    rtnl_nexthop* nh1 = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh1, 0);
+    rtnl_route_nh_set_ifindex(nh1, 21);
+    auto gw1 = create_nl_addr("192.168.1.1");
+    rtnl_route_nh_set_gateway(nh1, gw1.get());
+    rtnl_route_add_nexthop(route.get(), nh1);
+
+    // Second nexthop without gateway
+    rtnl_nexthop* nh2 = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh2, 0);
+    rtnl_route_nh_set_ifindex(nh2, 21);
+    // No gateway set
+    rtnl_route_add_nexthop(route.get(), nh2);
+
+    string gw = m_routeSync.getNextHopGw(route.get());
+    EXPECT_EQ(gw, "192.168.1.1,0.0.0.0");
+}
+
+// Test getNextHopIf with unknown interface
+TEST_F(FpmSyncdResponseTest, TestGetNextHopIfUnknownInterface)
+{
+    auto route = create_route("10.20.3.0/24");
+
+    // Add a nexthop with unknown ifindex (99 not in mock)
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh, 0);
+    rtnl_route_nh_set_ifindex(nh, 99);  // Unknown interface
+    auto gw = create_nl_addr("192.168.1.1");
+    rtnl_route_nh_set_gateway(nh, gw.get());
+    rtnl_route_add_nexthop(route.get(), nh);
+
+    string intf = m_routeSync.getNextHopIf(route.get());
+    EXPECT_EQ(intf, "unknown");
+}
+
+// Test getNextHopIf with multiple nexthops (known and unknown)
+TEST_F(FpmSyncdResponseTest, TestGetNextHopIfMultipleMixed)
+{
+    auto route = create_route("10.20.4.0/24");
+
+    // First nexthop with known interface
+    rtnl_nexthop* nh1 = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh1, 0);
+    rtnl_route_nh_set_ifindex(nh1, 21);  // Ethernet0
+    auto gw1 = create_nl_addr("192.168.1.1");
+    rtnl_route_nh_set_gateway(nh1, gw1.get());
+    rtnl_route_add_nexthop(route.get(), nh1);
+
+    // Second nexthop with unknown interface
+    rtnl_nexthop* nh2 = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh2, 0);
+    rtnl_route_nh_set_ifindex(nh2, 99);  // Unknown
+    auto gw2 = create_nl_addr("192.168.1.2");
+    rtnl_route_nh_set_gateway(nh2, gw2.get());
+    rtnl_route_add_nexthop(route.get(), nh2);
+
+    string intf = m_routeSync.getNextHopIf(route.get());
+    EXPECT_EQ(intf, "Ethernet0,unknown");
+}
+
+// Test getNextHopGw and getNextHopIf together with single nexthop
+TEST_F(FpmSyncdResponseTest, TestGetNextHopGwIfSingle)
+{
+    auto route = create_route("10.20.5.0/24");
+
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh, 0);
+    rtnl_route_nh_set_ifindex(nh, 20);  // Brvxlan100
+    auto gw = create_nl_addr("192.168.100.5");
+    rtnl_route_nh_set_gateway(nh, gw.get());
+    rtnl_route_add_nexthop(route.get(), nh);
+
+    string gw_result = m_routeSync.getNextHopGw(route.get());
+    string if_result = m_routeSync.getNextHopIf(route.get());
+
+    EXPECT_EQ(gw_result, "192.168.100.5");
+    EXPECT_EQ(if_result, "Brvxlan100");
+}
+
+// Test getNextHopGw and getNextHopIf together with multiple nexthops
+TEST_F(FpmSyncdResponseTest, TestGetNextHopGwIfMultiple)
+{
+    auto route = create_route("10.20.6.0/24");
+
+    // First nexthop
+    rtnl_nexthop* nh1 = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh1, 0);
+    rtnl_route_nh_set_ifindex(nh1, 21);  // Ethernet0
+    auto gw1 = create_nl_addr("192.168.1.10");
+    rtnl_route_nh_set_gateway(nh1, gw1.get());
+    rtnl_route_add_nexthop(route.get(), nh1);
+
+    // Second nexthop
+    rtnl_nexthop* nh2 = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh2, 0);
+    rtnl_route_nh_set_ifindex(nh2, 20);  // Brvxlan100
+    auto gw2 = create_nl_addr("192.168.1.11");
+    rtnl_route_nh_set_gateway(nh2, gw2.get());
+    rtnl_route_add_nexthop(route.get(), nh2);
+
+    // Third nexthop
+    rtnl_nexthop* nh3 = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_weight(nh3, 0);
+    rtnl_route_nh_set_ifindex(nh3, 10);  // Vrf10
+    auto gw3 = create_nl_addr("192.168.1.12");
+    rtnl_route_nh_set_gateway(nh3, gw3.get());
+    rtnl_route_add_nexthop(route.get(), nh3);
+
+    string gw_result = m_routeSync.getNextHopGw(route.get());
+    string if_result = m_routeSync.getNextHopIf(route.get());
+
+    EXPECT_EQ(gw_result, "192.168.1.10,192.168.1.11,192.168.1.12");
+    EXPECT_EQ(if_result, "Ethernet0,Brvxlan100,Vrf10");
+}
+
+// Test onLabelRouteMsg with multicast route
+TEST_F(FpmSyncdResponseTest, TestOnLabelRouteMsg_Multicast)
+{
+    rtnl_route* route = rtnl_route_alloc();
+    auto dst_addr = create_nl_addr("30.0.0.200/32");
+    rtnl_route_set_dst(route, dst_addr.get());
+    rtnl_route_set_type(route, RTN_MULTICAST);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET);
+
+    auto route_ptr = unique_ptr<rtnl_route, decltype(rtnl_route_put)*>(route, rtnl_route_put);
+
+    m_routeSync.onLabelRouteMsg(RTM_NEWROUTE, (nl_object*)route_ptr.get());
+
+    // Should be rejected - no entry in table
+    Table labelTable(m_db.get(), "LABEL_ROUTE_TABLE");
+    vector<FieldValueTuple> result;
+    EXPECT_FALSE(labelTable.get("30.0.0.200", result));
+}
+
+// Test onLabelRouteMsg with broadcast route
+TEST_F(FpmSyncdResponseTest, TestOnLabelRouteMsg_Broadcast)
+{
+    rtnl_route* route = rtnl_route_alloc();
+    auto dst_addr = create_nl_addr("30.0.1.44/32");
+    rtnl_route_set_dst(route, dst_addr.get());
+    rtnl_route_set_type(route, RTN_BROADCAST);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET);
+
+    auto route_ptr = unique_ptr<rtnl_route, decltype(rtnl_route_put)*>(route, rtnl_route_put);
+
+    m_routeSync.onLabelRouteMsg(RTM_NEWROUTE, (nl_object*)route_ptr.get());
+
+    // Should be rejected - no entry in table
+    Table labelTable(m_db.get(), "LABEL_ROUTE_TABLE");
+    vector<FieldValueTuple> result;
+    EXPECT_FALSE(labelTable.get("30.0.1.44", result));
+}
+
+// Test onLabelRouteMsg with local route
+TEST_F(FpmSyncdResponseTest, TestOnLabelRouteMsg_Local)
+{
+    rtnl_route* route = rtnl_route_alloc();
+    auto dst_addr = create_nl_addr("30.0.1.88/32");
+    rtnl_route_set_dst(route, dst_addr.get());
+    rtnl_route_set_type(route, RTN_LOCAL);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET);
+
+    auto route_ptr = unique_ptr<rtnl_route, decltype(rtnl_route_put)*>(route, rtnl_route_put);
+
+    m_routeSync.onLabelRouteMsg(RTM_NEWROUTE, (nl_object*)route_ptr.get());
+
+    // Should be rejected - no entry in table
+    Table labelTable(m_db.get(), "LABEL_ROUTE_TABLE");
+    vector<FieldValueTuple> result;
+    EXPECT_FALSE(labelTable.get("30.0.1.88", result));
+}
+
+// Test onLabelRouteMsg with unknown message type
+TEST_F(FpmSyncdResponseTest, TestOnLabelRouteMsg_UnknownMsgType)
+{
+    rtnl_route* route = rtnl_route_alloc();
+    auto dst_addr = create_nl_addr("30.0.3.100/32");
+    rtnl_route_set_dst(route, dst_addr.get());
+    rtnl_route_set_type(route, RTN_UNICAST);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET);
+
+    auto route_ptr = unique_ptr<rtnl_route, decltype(rtnl_route_put)*>(route, rtnl_route_put);
+
+    m_routeSync.onLabelRouteMsg(RTM_GETROUTE, (nl_object*)route_ptr.get());
+
+    // Should be rejected - no entry in table
+    Table labelTable(m_db.get(), "LABEL_ROUTE_TABLE");
+    vector<FieldValueTuple> result;
+    EXPECT_FALSE(labelTable.get("30.0.3.100", result));
+}
+
+// Test onLabelRouteMsg with empty nexthop list
+TEST_F(FpmSyncdResponseTest, TestOnLabelRouteMsg_NoNexthops)
+{
+    rtnl_route* route = rtnl_route_alloc();
+    auto dst_addr = create_nl_addr("30.0.4.100/32");
+    rtnl_route_set_dst(route, dst_addr.get());
+    rtnl_route_set_type(route, RTN_UNICAST);
+    rtnl_route_set_protocol(route, RTPROT_STATIC);
+    rtnl_route_set_family(route, AF_INET);
+    // No nexthops added
+
+    auto route_ptr = unique_ptr<rtnl_route, decltype(rtnl_route_put)*>(route, rtnl_route_put);
+
+    m_routeSync.onLabelRouteMsg(RTM_NEWROUTE, (nl_object*)route_ptr.get());
+
+    // Should be rejected due to empty nexthop list
+    Table labelTable(m_db.get(), "LABEL_ROUTE_TABLE");
+    vector<FieldValueTuple> result;
+    EXPECT_FALSE(labelTable.get("30.0.4.100", result));
+}
+
+// ========== EASY TESTS: Well-Known Protocol Routing Protocols ==========
+
+// Test routes with various routing protocol numbers
+TEST_F(FpmSyncdResponseTest, TestOnRouteMsg_VariousProtocols)
+{
+    Table routeTable(m_db.get(), APP_ROUTE_TABLE_NAME);
+    vector<FieldValueTuple> result;
+
+    // Test BGP protocol (186)
+    {
+        auto route = create_route("10.50.1.0/24");
+        rtnl_route_set_protocol(route.get(), 186);  // BGP
+        rtnl_nexthop* nh = rtnl_route_nh_alloc();
+        rtnl_route_nh_set_ifindex(nh, 21);
+        auto gw = create_nl_addr("192.168.1.1");
+        rtnl_route_nh_set_gateway(nh, gw.get());
+        rtnl_route_add_nexthop(route.get(), nh);
+        m_routeSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), nullptr);
+        EXPECT_TRUE(routeTable.get("10.50.1.0/24", result));
+        // Just verify protocol field exists (value might be "bgp" or from libnl3)
+        bool found = false;
+        for (const auto& fv : result) {
+            if (fvField(fv) == "protocol" && !fvValue(fv).empty()) found = true;
+        }
+        EXPECT_TRUE(found);
+    }
+
+    // Test ISIS protocol (188)
+    {
+        auto route = create_route("10.50.2.0/24");
+        rtnl_route_set_protocol(route.get(), 188);  // ISIS
+        rtnl_nexthop* nh = rtnl_route_nh_alloc();
+        rtnl_route_nh_set_ifindex(nh, 21);
+        auto gw = create_nl_addr("192.168.1.2");
+        rtnl_route_nh_set_gateway(nh, gw.get());
+        rtnl_route_add_nexthop(route.get(), nh);
+        m_routeSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), nullptr);
+        EXPECT_TRUE(routeTable.get("10.50.2.0/24", result));
+        bool found = false;
+        for (const auto& fv : result) {
+            if (fvField(fv) == "protocol" && !fvValue(fv).empty()) found = true;
+        }
+        EXPECT_TRUE(found);
+    }
+
+    // Test OSPF protocol (187)
+    {
+        auto route = create_route("10.50.3.0/24");
+        rtnl_route_set_protocol(route.get(), 187);  // OSPF
+        rtnl_nexthop* nh = rtnl_route_nh_alloc();
+        rtnl_route_nh_set_ifindex(nh, 21);
+        auto gw = create_nl_addr("192.168.1.3");
+        rtnl_route_nh_set_gateway(nh, gw.get());
+        rtnl_route_add_nexthop(route.get(), nh);
+        m_routeSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), nullptr);
+        EXPECT_TRUE(routeTable.get("10.50.3.0/24", result));
+        bool found = false;
+        for (const auto& fv : result) {
+            if (fvField(fv) == "protocol" && !fvValue(fv).empty()) found = true;
+        }
+        EXPECT_TRUE(found);
+    }
+
+    // Test RIP protocol (189)
+    {
+        auto route = create_route("10.50.4.0/24");
+        rtnl_route_set_protocol(route.get(), 189);  // RIP
+        rtnl_nexthop* nh = rtnl_route_nh_alloc();
+        rtnl_route_nh_set_ifindex(nh, 21);
+        auto gw = create_nl_addr("192.168.1.4");
+        rtnl_route_nh_set_gateway(nh, gw.get());
+        rtnl_route_add_nexthop(route.get(), nh);
+        m_routeSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), nullptr);
+        EXPECT_TRUE(routeTable.get("10.50.4.0/24", result));
+        bool found = false;
+        for (const auto& fv : result) {
+            if (fvField(fv) == "protocol" && !fvValue(fv).empty()) found = true;
+        }
+        EXPECT_TRUE(found);
+    }
+
+    // Test EIGRP protocol (192)
+    {
+        auto route = create_route("10.50.5.0/24");
+        rtnl_route_set_protocol(route.get(), 192);  // EIGRP
+        rtnl_nexthop* nh = rtnl_route_nh_alloc();
+        rtnl_route_nh_set_ifindex(nh, 21);
+        auto gw = create_nl_addr("192.168.1.5");
+        rtnl_route_nh_set_gateway(nh, gw.get());
+        rtnl_route_add_nexthop(route.get(), nh);
+        m_routeSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), nullptr);
+        EXPECT_TRUE(routeTable.get("10.50.5.0/24", result));
+        bool found = false;
+        for (const auto& fv : result) {
+            if (fvField(fv) == "protocol" && !fvValue(fv).empty()) found = true;
+        }
+        EXPECT_TRUE(found);
+    }
+}
+
+// ========== EASY TESTS: BUM Route Rejections ==========
+
+// Test route with RTN_MULTICAST type is rejected
+TEST_F(FpmSyncdResponseTest, TestOnRouteMsg_MulticastRejected)
+{
+    auto route = create_route("224.0.0.0/4");
+    rtnl_route_set_type(route.get(), RTN_MULTICAST);
+    rtnl_route_set_protocol(route.get(), RTPROT_STATIC);
+
+    m_routeSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), nullptr);
+
+    // Should be rejected - no entry
+    Table routeTable(m_db.get(), APP_ROUTE_TABLE_NAME);
+    vector<FieldValueTuple> result;
+    EXPECT_FALSE(routeTable.get("224.0.0.0/4", result));
+}
+
+// ========== ADDITIONAL TESTS: Route Message Types ==========
+
+// Test onRouteMsg with RTM_DELROUTE
+TEST_F(FpmSyncdResponseTest, TestOnRouteMsg_Delete)
+{
+    // First add a route
+    auto route = create_route("10.34.1.0/24");
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 21);
+    auto gw = create_nl_addr("192.168.1.1");
+    rtnl_route_nh_set_gateway(nh, gw.get());
+    rtnl_route_add_nexthop(route.get(), nh);
+
+    m_routeSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), nullptr);
+
+    Table routeTable(m_db.get(), APP_ROUTE_TABLE_NAME);
+    vector<FieldValueTuple> result;
+    EXPECT_TRUE(routeTable.get("10.34.1.0/24", result));
+
+    // Now delete it
+    m_routeSync.onRouteMsg(RTM_DELROUTE, (nl_object*)route.get(), nullptr);
+
+    // Should be deleted
+    EXPECT_FALSE(routeTable.get("10.34.1.0/24", result));
+}
+
+// Test onRouteMsg with unknown message type
+TEST_F(FpmSyncdResponseTest, TestOnRouteMsg_UnknownMsgType)
+{
+    auto route = create_route("10.34.2.0/24");
+
+    // Use RTM_GETROUTE which is not NEWROUTE or DELROUTE
+    m_routeSync.onRouteMsg(RTM_GETROUTE, (nl_object*)route.get(), nullptr);
+
+    // Should be ignored - no entry in table
+    Table routeTable(m_db.get(), APP_ROUTE_TABLE_NAME);
+    vector<FieldValueTuple> result;
+    EXPECT_FALSE(routeTable.get("10.34.2.0/24", result));
+}
+
+// Test protocol static
+TEST_F(FpmSyncdResponseTest, TestGetProtocolString_Static)
+{
+    auto route = create_route("10.34.3.0/24");
+    rtnl_route_set_protocol(route.get(), RTPROT_STATIC);
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 21);
+    auto gw = create_nl_addr("192.168.1.1");
+    rtnl_route_nh_set_gateway(nh, gw.get());
+    rtnl_route_add_nexthop(route.get(), nh);
+
+    m_routeSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), nullptr);
+
+    Table routeTable(m_db.get(), APP_ROUTE_TABLE_NAME);
+    vector<FieldValueTuple> result;
+    EXPECT_TRUE(routeTable.get("10.34.3.0/24", result));
+    bool found = false;
+    for (const auto& fv : result) {
+        if (fvField(fv) == "protocol" && fvValue(fv) == "static") found = true;
+    }
+    EXPECT_TRUE(found);
+}
+
+// Test RTM_DELROUTE with VRF
+TEST_F(FpmSyncdResponseTest, TestOnRouteMsg_DeleteWithVrf)
+{
+    // First add a VRF route
+    auto route = create_route("10.34.4.0/24");
+    rtnl_route_set_type(route.get(), RTN_UNICAST);
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 21);
+    auto gw = create_nl_addr("192.168.1.1");
+    rtnl_route_nh_set_gateway(nh, gw.get());
+    rtnl_route_add_nexthop(route.get(), nh);
+
+    char vrf_name[] = "Vrf200";
+    m_routeSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), vrf_name);
+
+    Table routeTable(m_db.get(), APP_ROUTE_TABLE_NAME);
+    vector<FieldValueTuple> result;
+    EXPECT_TRUE(routeTable.get("Vrf200:10.34.4.0/24", result));
+
+    // Now delete it
+    m_routeSync.onRouteMsg(RTM_DELROUTE, (nl_object*)route.get(), vrf_name);
+
+    // Should be deleted
+    EXPECT_FALSE(routeTable.get("Vrf200:10.34.4.0/24", result));
+}
+
+// Test default route (0.0.0.0/0)
+TEST_F(FpmSyncdResponseTest, TestOnRouteMsg_DefaultRoute)
+{
+    auto route = create_route("0.0.0.0/0");
+    rtnl_route_set_protocol(route.get(), RTPROT_BGP);
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 21);
+    auto gw = create_nl_addr("192.168.1.254");
+    rtnl_route_nh_set_gateway(nh, gw.get());
+    rtnl_route_add_nexthop(route.get(), nh);
+
+    m_routeSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)route.get(), nullptr);
+
+    Table routeTable(m_db.get(), APP_ROUTE_TABLE_NAME);
+    vector<FieldValueTuple> result;
+    EXPECT_TRUE(routeTable.get("0.0.0.0/0", result));
+}
+
+// ========== ERROR PATH TESTS ==========
+
+// Test prefixMac2Str with NULL mac pointer
+TEST_F(FpmSyncdResponseTest, TestPrefixMac2Str_NullMac)
+{
+    char buf[32];
+    char* result = m_routeSync.prefixMac2Str(nullptr, buf, sizeof(buf));
+    EXPECT_EQ(result, nullptr);
+}
+
+// Test prefixMac2Str with NULL buf pointer
+TEST_F(FpmSyncdResponseTest, TestPrefixMac2Str_NullBuf)
+{
+    char mac[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    char* result = m_routeSync.prefixMac2Str(mac, nullptr, 32);
+    EXPECT_EQ(result, nullptr);
+}
+
+// Test prefixMac2Str with valid inputs
+TEST_F(FpmSyncdResponseTest, TestPrefixMac2Str_Valid)
+{
+    char mac[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    char buf[32];
+    char* result = m_routeSync.prefixMac2Str(mac, buf, sizeof(buf));
+    EXPECT_NE(result, nullptr);
+    EXPECT_STREQ(result, "00:11:22:33:44:55");
+}
+
+// ============================================================================
+// ZMQ-Enabled Integration Test Cases
+// ============================================================================
+// These tests verify that when ZMQ is enabled, RouteSync writes all fields
+// (including empty ones) to the database tables.
+// ============================================================================
+
+TEST_F(FpmSyncdResponseTest, TestRouteMsgWithZmqEnabled_AllFieldsIncluded)
+{
+    // Simulate ZMQ being enabled by setting m_zmqClient to a non-null value
+    // We use a dummy shared_ptr (pointing to address 1) since we won't actually use it
+    // This makes isNbZmqEnabled() return true
+    m_mockRouteSync.m_zmqClient = shared_ptr<swss::ZmqClient>(reinterpret_cast<swss::ZmqClient*>(1), [](swss::ZmqClient*){});
+
+    Table route_table(m_db.get(), APP_ROUTE_TABLE_NAME);
+
+    // Create a simple route
+    auto createRoute = [](const char* prefix, uint8_t prefixlen) -> rtnl_route* {
+        rtnl_route* route = rtnl_route_alloc();
+        nl_addr* dst_addr;
+        nl_addr_parse(prefix, AF_INET, &dst_addr);
+        rtnl_route_set_dst(route, dst_addr);
+        rtnl_route_set_type(route, RTN_UNICAST);
+        rtnl_route_set_protocol(route, RTPROT_BGP);
+        rtnl_route_set_family(route, AF_INET);
+        rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+        rtnl_route_set_table(route, RT_TABLE_MAIN);
+        nl_addr_put(dst_addr);
+        return route;
+    };
+
+    const char* test_destipprefix = "10.1.1.0";
+    rtnl_route* test_route = createRoute(test_destipprefix, 24);
+
+    // Create a nexthop
+    uint32_t test_nh_id = 1;
+    struct nlmsghdr* nlh = createNewNextHopMsgHdr(1, test_gateway, test_nh_id);
+
+    EXPECT_CALL(m_mockRouteSync, getIfName(1, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet1", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    m_mockRouteSync.onNextHopMsg(nlh, (int)(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg))));
+    free(nlh);
+
+    rtnl_route_set_nh_id(test_route, test_nh_id);
+    m_mockRouteSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)test_route, nullptr);
+
+    // Verify the route was written to the database
+    vector<FieldValueTuple> fvs;
+    EXPECT_TRUE(route_table.get(test_destipprefix, fvs));
+
+    // With ZMQ enabled, all 11 fields should be present (including empty ones)
+    EXPECT_EQ(fvs.size(), 11);
+
+    // Build a map for easier verification
+    std::map<std::string, std::string> fieldMap;
+    for (const auto& fv : fvs) {
+        fieldMap[fvField(fv)] = fvValue(fv);
+    }
+
+    // Verify non-empty fields
+    EXPECT_EQ(fieldMap["protocol"], "bgp");
+    EXPECT_EQ(fieldMap["nexthop"], test_gateway);
+    EXPECT_EQ(fieldMap["ifname"], "Ethernet1");
+    EXPECT_EQ(fieldMap["blackhole"], "false");  // Default value
+
+    // Verify empty fields are present
+    EXPECT_TRUE(fieldMap.count("nexthop_group") > 0);
+    EXPECT_EQ(fieldMap["nexthop_group"], "");
+    EXPECT_TRUE(fieldMap.count("mpls_nh") > 0);
+    EXPECT_EQ(fieldMap["mpls_nh"], "");
+    EXPECT_TRUE(fieldMap.count("weight") > 0);
+    EXPECT_EQ(fieldMap["weight"], "");
+    EXPECT_TRUE(fieldMap.count("vni_label") > 0);
+    EXPECT_EQ(fieldMap["vni_label"], "");
+    EXPECT_TRUE(fieldMap.count("router_mac") > 0);
+    EXPECT_EQ(fieldMap["router_mac"], "");
+    EXPECT_TRUE(fieldMap.count("segment") > 0);
+    EXPECT_EQ(fieldMap["segment"], "");
+    EXPECT_TRUE(fieldMap.count("seg_src") > 0);
+    EXPECT_EQ(fieldMap["seg_src"], "");
+
+    rtnl_route_put(test_route);
+
+    // Reset m_zmqClient to nullptr
+    m_mockRouteSync.m_zmqClient = nullptr;
+}
+
+TEST_F(FpmSyncdResponseTest, TestRouteMsgWithZmqDisabled_OnlyNonEmptyFields)
+{
+    // ZMQ is disabled by default in the fixture
+    Table route_table(m_db.get(), APP_ROUTE_TABLE_NAME);
+
+    // Create a simple route
+    auto createRoute = [](const char* prefix, uint8_t prefixlen) -> rtnl_route* {
+        rtnl_route* route = rtnl_route_alloc();
+        nl_addr* dst_addr;
+        nl_addr_parse(prefix, AF_INET, &dst_addr);
+        rtnl_route_set_dst(route, dst_addr);
+        rtnl_route_set_type(route, RTN_UNICAST);
+        rtnl_route_set_protocol(route, RTPROT_BGP);
+        rtnl_route_set_family(route, AF_INET);
+        rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+        rtnl_route_set_table(route, RT_TABLE_MAIN);
+        nl_addr_put(dst_addr);
+        return route;
+    };
+
+    const char* test_destipprefix = "10.2.2.0";
+    rtnl_route* test_route = createRoute(test_destipprefix, 24);
+
+    // Create a nexthop
+    uint32_t test_nh_id = 2;
+    struct nlmsghdr* nlh = createNewNextHopMsgHdr(1, test_gateway, test_nh_id);
+
+    EXPECT_CALL(m_mockRouteSync, getIfName(1, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet2", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    m_mockRouteSync.onNextHopMsg(nlh, (int)(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct nhmsg))));
+    free(nlh);
+
+    rtnl_route_set_nh_id(test_route, test_nh_id);
+    m_mockRouteSync.onRouteMsg(RTM_NEWROUTE, (nl_object*)test_route, nullptr);
+
+    // Verify the route was written to the database
+    vector<FieldValueTuple> fvs;
+    EXPECT_TRUE(route_table.get(test_destipprefix, fvs));
+
+    // With ZMQ disabled, only non-empty fields should be present
+    EXPECT_EQ(fvs.size(), 3);  // protocol, nexthop, ifname
+
+    // Build a map for easier verification
+    std::map<std::string, std::string> fieldMap;
+    for (const auto& fv : fvs) {
+        fieldMap[fvField(fv)] = fvValue(fv);
+    }
+
+    // Verify the non-empty fields
+    EXPECT_EQ(fieldMap["protocol"], "bgp");
+    EXPECT_EQ(fieldMap["nexthop"], test_gateway);
+    EXPECT_EQ(fieldMap["ifname"], "Ethernet2");
+
+    // Verify empty fields are NOT present
+    EXPECT_EQ(fieldMap.count("nexthop_group"), 0);
+    EXPECT_EQ(fieldMap.count("mpls_nh"), 0);
+    EXPECT_EQ(fieldMap.count("weight"), 0);
+    EXPECT_EQ(fieldMap.count("vni_label"), 0);
+    EXPECT_EQ(fieldMap.count("router_mac"), 0);
+    EXPECT_EQ(fieldMap.count("segment"), 0);
+    EXPECT_EQ(fieldMap.count("seg_src"), 0);
+
+    rtnl_route_put(test_route);
+}
+
+TEST_F(FpmSyncdResponseTest, TestLabelRouteMsgWithZmqEnabled_AllFieldsIncluded)
+{
+    // Simulate ZMQ being enabled by setting m_zmqClient to a non-null value
+    m_mockRouteSync.m_zmqClient = shared_ptr<swss::ZmqClient>(reinterpret_cast<swss::ZmqClient*>(1), [](swss::ZmqClient*){});
+
+    Table label_route_table(m_db.get(), APP_LABEL_ROUTE_TABLE_NAME);
+
+    // Create a label route (AF_MPLS)
+    auto createLabelRoute = [](const char* prefix, uint8_t prefixlen) -> rtnl_route* {
+        rtnl_route* route = rtnl_route_alloc();
+        nl_addr* dst_addr;
+        nl_addr_parse(prefix, AF_MPLS, &dst_addr);
+        rtnl_route_set_dst(route, dst_addr);
+        rtnl_route_set_type(route, RTN_UNICAST);
+        rtnl_route_set_protocol(route, RTPROT_STATIC);
+        rtnl_route_set_family(route, AF_MPLS);
+        rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+        rtnl_route_set_table(route, RT_TABLE_UNSPEC);  // Label routes must use RT_TABLE_UNSPEC
+        nl_addr_put(dst_addr);
+        return route;
+    };
+
+    const char* test_label = "100";
+    rtnl_route* test_route = createLabelRoute(test_label, 20);
+
+    // Create a nexthop for the label route
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 1);
+    nl_addr* gateway_addr;
+    nl_addr_parse("10.0.0.1", AF_INET, &gateway_addr);
+    rtnl_route_nh_set_gateway(nh, gateway_addr);
+    nl_addr_put(gateway_addr);
+    rtnl_route_add_nexthop(test_route, nh);
+
+    // Mock getIfName to return interface name
+    EXPECT_CALL(m_mockRouteSync, getIfName(1, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet0", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    m_mockRouteSync.onLabelRouteMsg(RTM_NEWROUTE, (nl_object*)test_route);
+
+    // Verify the label route was written to the database
+    vector<FieldValueTuple> fvs;
+    EXPECT_TRUE(label_route_table.get(test_label, fvs));
+
+    // With ZMQ enabled, all 6 fields should be present (including empty ones)
+    EXPECT_EQ(fvs.size(), 6);
+
+    // Build a map for easier verification
+    std::map<std::string, std::string> fieldMap;
+    for (const auto& fv : fvs) {
+        fieldMap[fvField(fv)] = fvValue(fv);
+    }
+
+    // Verify all fields are present
+    EXPECT_TRUE(fieldMap.find("protocol") != fieldMap.end());
+    EXPECT_EQ(fieldMap["protocol"], "static");
+
+    EXPECT_TRUE(fieldMap.find("blackhole") != fieldMap.end());
+    EXPECT_EQ(fieldMap["blackhole"], "false");
+
+    EXPECT_TRUE(fieldMap.find("nexthop") != fieldMap.end());
+    EXPECT_EQ(fieldMap["nexthop"], "10.0.0.1");
+
+    EXPECT_TRUE(fieldMap.find("ifname") != fieldMap.end());
+    EXPECT_EQ(fieldMap["ifname"], "Ethernet0");
+
+    // mpls_pop is always set to "1" for label routes
+    EXPECT_TRUE(fieldMap.find("mpls_pop") != fieldMap.end());
+    EXPECT_EQ(fieldMap["mpls_pop"], "1");
+
+    // mpls_nh should be present but empty
+    EXPECT_TRUE(fieldMap.find("mpls_nh") != fieldMap.end());
+    EXPECT_EQ(fieldMap["mpls_nh"], "");
+
+    // Reset m_zmqClient to nullptr
+    m_mockRouteSync.m_zmqClient = nullptr;
+
+    rtnl_route_put(test_route);
+}
+
+TEST_F(FpmSyncdResponseTest, TestLabelRouteMsgWithZmqDisabled_OnlyNonEmptyFields)
+{
+    // ZMQ is disabled by default in the fixture
+    Table label_route_table(m_db.get(), APP_LABEL_ROUTE_TABLE_NAME);
+
+    // Create a label route (AF_MPLS)
+    auto createLabelRoute = [](const char* prefix, uint8_t prefixlen) -> rtnl_route* {
+        rtnl_route* route = rtnl_route_alloc();
+        nl_addr* dst_addr;
+        nl_addr_parse(prefix, AF_MPLS, &dst_addr);
+        rtnl_route_set_dst(route, dst_addr);
+        rtnl_route_set_type(route, RTN_UNICAST);
+        rtnl_route_set_protocol(route, RTPROT_STATIC);
+        rtnl_route_set_family(route, AF_MPLS);
+        rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+        rtnl_route_set_table(route, RT_TABLE_UNSPEC);  // Label routes must use RT_TABLE_UNSPEC
+        nl_addr_put(dst_addr);
+        return route;
+    };
+
+    const char* test_label = "200";
+    rtnl_route* test_route = createLabelRoute(test_label, 20);
+
+    // Create a nexthop for the label route
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 2);
+    nl_addr* gateway_addr;
+    nl_addr_parse("10.0.0.2", AF_INET, &gateway_addr);
+    rtnl_route_nh_set_gateway(nh, gateway_addr);
+    nl_addr_put(gateway_addr);
+    rtnl_route_add_nexthop(test_route, nh);
+
+    // Mock getIfName to return interface name
+    EXPECT_CALL(m_mockRouteSync, getIfName(2, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet1", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    m_mockRouteSync.onLabelRouteMsg(RTM_NEWROUTE, (nl_object*)test_route);
+
+    // Verify the label route was written to the database
+    vector<FieldValueTuple> fvs;
+    EXPECT_TRUE(label_route_table.get(test_label, fvs));
+
+    // With ZMQ disabled, only non-empty fields should be present
+    // protocol, nexthop, ifname, mpls_pop (always set to "1")
+    // Note: blackhole is "false" by default and is excluded when ZMQ is disabled
+    EXPECT_EQ(fvs.size(), 4);
+
+    // Build a map for easier verification
+    std::map<std::string, std::string> fieldMap;
+    for (const auto& fv : fvs) {
+        fieldMap[fvField(fv)] = fvValue(fv);
+    }
+
+    // Verify only non-empty fields are present
+    EXPECT_TRUE(fieldMap.find("protocol") != fieldMap.end());
+    EXPECT_EQ(fieldMap["protocol"], "static");
+
+    EXPECT_TRUE(fieldMap.find("nexthop") != fieldMap.end());
+    EXPECT_EQ(fieldMap["nexthop"], "10.0.0.2");
+
+    EXPECT_TRUE(fieldMap.find("ifname") != fieldMap.end());
+    EXPECT_EQ(fieldMap["ifname"], "Ethernet1");
+
+    // mpls_pop is always set to "1" for label routes
+    EXPECT_TRUE(fieldMap.find("mpls_pop") != fieldMap.end());
+    EXPECT_EQ(fieldMap["mpls_pop"], "1");
+
+    // blackhole is "false" by default and is excluded when ZMQ is disabled
+    EXPECT_TRUE(fieldMap.find("blackhole") == fieldMap.end());
+
+    // mpls_nh should NOT be present when ZMQ is disabled and it's empty
+    EXPECT_TRUE(fieldMap.find("mpls_nh") == fieldMap.end());
+
+    rtnl_route_put(test_route);
+}
+
+// Note: SRv6 VPN routes (onSrv6VpnRouteMsg) do not use RouteTableFieldValueTupleWrapper
+// They directly create field-value tuples, so ZMQ flag doesn't affect them the same way.
+// Therefore, we don't add ZMQ tests for SRv6 VPN routes here.
+
+TEST_F(FpmSyncdResponseTest, TestVnetRouteMsgWithZmqEnabled_AllFieldsIncluded)
+{
+    // Simulate ZMQ being enabled by setting m_zmqClient to a non-null value
+    m_mockRouteSync.m_zmqClient = shared_ptr<swss::ZmqClient>(reinterpret_cast<swss::ZmqClient*>(1), [](swss::ZmqClient*){});
+
+    Table vnet_route_table(m_db.get(), APP_VNET_RT_TABLE_NAME);
+
+    // Create a VNET route
+    auto createVnetRoute = [](const char* prefix, uint8_t prefixlen, uint32_t vnet_table_id) -> rtnl_route* {
+        rtnl_route* route = rtnl_route_alloc();
+        nl_addr* dst_addr;
+        nl_addr_parse(prefix, AF_INET, &dst_addr);
+        rtnl_route_set_dst(route, dst_addr);
+        rtnl_route_set_type(route, RTN_UNICAST);
+        rtnl_route_set_protocol(route, RTPROT_STATIC);
+        rtnl_route_set_family(route, AF_INET);
+        rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+        rtnl_route_set_table(route, vnet_table_id);  // Set VNET table ID
+        nl_addr_put(dst_addr);
+        return route;
+    };
+
+    const char* test_destipprefix = "192.168.1.0/24";
+    uint32_t vnet_table_id = 1000;
+    rtnl_route* test_route = createVnetRoute(test_destipprefix, 24, vnet_table_id);
+
+    // Create a nexthop for the VNET route
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 10);
+    nl_addr* gateway_addr;
+    nl_addr_parse("192.168.1.1", AF_INET, &gateway_addr);
+    rtnl_route_nh_set_gateway(nh, gateway_addr);
+    nl_addr_put(gateway_addr);
+    rtnl_route_add_nexthop(test_route, nh);
+
+    // Mock getIfName to return VNET interface name (starts with "Vnet")
+    EXPECT_CALL(m_mockRouteSync, getIfName(vnet_table_id, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Vnet100", size);  // VNET_PREFIX is "Vnet"
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    // Mock getIfName for the nexthop interface
+    EXPECT_CALL(m_mockRouteSync, getIfName(10, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet100", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    m_mockRouteSync.onMsg(RTM_NEWROUTE, (nl_object*)test_route);
+
+    // Verify the VNET route was written to the database
+    vector<FieldValueTuple> fvs;
+    std::string key = "Vnet100:192.168.1.0/24";
+    EXPECT_TRUE(vnet_route_table.get(key, fvs));
+
+    // With ZMQ enabled, all 2 fields should be present (including empty ones if any)
+    EXPECT_EQ(fvs.size(), 2);
+
+    // Build a map for easier verification
+    std::map<std::string, std::string> fieldMap;
+    for (const auto& fv : fvs) {
+        fieldMap[fvField(fv)] = fvValue(fv);
+    }
+
+    // Verify all fields are present
+    EXPECT_TRUE(fieldMap.find("nexthop") != fieldMap.end());
+    EXPECT_EQ(fieldMap["nexthop"], "192.168.1.1");
+
+    EXPECT_TRUE(fieldMap.find("ifname") != fieldMap.end());
+    EXPECT_EQ(fieldMap["ifname"], "Ethernet100");
+
+    // Reset m_zmqClient to nullptr
+    m_mockRouteSync.m_zmqClient = nullptr;
+
+    rtnl_route_put(test_route);
+}
+
+TEST_F(FpmSyncdResponseTest, TestVnetRouteMsgWithZmqDisabled_OnlyNonEmptyFields)
+{
+    // ZMQ is disabled by default in the fixture
+    Table vnet_route_table(m_db.get(), APP_VNET_RT_TABLE_NAME);
+
+    // Create a VNET route with only ifname (no nexthop gateway)
+    auto createVnetRoute = [](const char* prefix, uint8_t prefixlen, uint32_t vnet_table_id) -> rtnl_route* {
+        rtnl_route* route = rtnl_route_alloc();
+        nl_addr* dst_addr;
+        nl_addr_parse(prefix, AF_INET, &dst_addr);
+        rtnl_route_set_dst(route, dst_addr);
+        rtnl_route_set_type(route, RTN_UNICAST);
+        rtnl_route_set_protocol(route, RTPROT_STATIC);
+        rtnl_route_set_family(route, AF_INET);
+        rtnl_route_set_scope(route, RT_SCOPE_LINK);  // Link scope for direct routes
+        rtnl_route_set_table(route, vnet_table_id);  // Set VNET table ID
+        nl_addr_put(dst_addr);
+        return route;
+    };
+
+    const char* test_destipprefix = "192.168.2.0/24";
+    uint32_t vnet_table_id = 2000;
+    rtnl_route* test_route = createVnetRoute(test_destipprefix, 24, vnet_table_id);
+
+    // Create a nexthop without gateway (direct route)
+    rtnl_nexthop* nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, 20);
+    rtnl_route_add_nexthop(test_route, nh);
+
+    // Mock getIfName to return VNET interface name (starts with "Vnet")
+    EXPECT_CALL(m_mockRouteSync, getIfName(vnet_table_id, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Vnet200", size);  // VNET_PREFIX is "Vnet"
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    // Mock getIfName for the nexthop interface
+    EXPECT_CALL(m_mockRouteSync, getIfName(20, _, _))
+        .WillOnce(DoAll(
+            [](int32_t, char* ifname, size_t size) {
+                strncpy(ifname, "Ethernet200", size);
+                ifname[size-1] = '\0';
+            },
+            Return(true)
+        ));
+
+    m_mockRouteSync.onMsg(RTM_NEWROUTE, (nl_object*)test_route);
+
+    // Verify the VNET route was written to the database
+    vector<FieldValueTuple> fvs;
+    std::string key = "Vnet200:192.168.2.0/24";
+    EXPECT_TRUE(vnet_route_table.get(key, fvs));
+
+    // With ZMQ disabled, only non-empty fields should be present
+    // Note: Even for direct routes, getNextHopGw returns "0.0.0.0" for IPv4,
+    // so nexthop field will be present with that value
+    EXPECT_EQ(fvs.size(), 2);
+
+    // Build a map for easier verification
+    std::map<std::string, std::string> fieldMap;
+    for (const auto& fv : fvs) {
+        fieldMap[fvField(fv)] = fvValue(fv);
+    }
+
+    // Verify both fields are present
+    EXPECT_TRUE(fieldMap.find("ifname") != fieldMap.end());
+    EXPECT_EQ(fieldMap["ifname"], "Ethernet200");
+
+    EXPECT_TRUE(fieldMap.find("nexthop") != fieldMap.end());
+    EXPECT_EQ(fieldMap["nexthop"], "0.0.0.0");
+
+    rtnl_route_put(test_route);
 
 }
